@@ -45,28 +45,66 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --target <name>     target: mcs51, c51, 8051 (default: host)\n");
     fprintf(stderr, "  --model <name>      C51 memory model: small, compact, large\n");
     fprintf(stderr, "  --no-build          output C51 source to stdout instead of HEX\n");
-    fprintf(stderr, "  @<file>             read input file list from <file>\n");
+    fprintf(stderr, "  @<file>             read arguments (options + inputs) from <file>\n");
+}
+
+/* ─── 从 @file 展开参数到 token 列表（自动跳过注释行，按空白拆分） ─── */
+static void expand_argfile(const char *path, List *tokens) {
+    FILE *lf = fopen(path, "r");
+    if (!lf) { fprintf(stderr, "error: cannot open '%s'\n", path); exit(1); }
+    char line[4096];
+    while (fgets(line, sizeof(line), lf)) {
+        /* 去掉尾部空白 */
+        int len = (int)strlen(line);
+        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r' || line[len-1] == ' ' || line[len-1] == '\t'))
+            line[--len] = '\0';
+        if (len == 0 || line[0] == '#') continue;
+        /* 按空白拆分 token */
+        char *p = line;
+        while (*p) {
+            while (*p == ' ' || *p == '\t') p++;
+            if (!*p) break;
+            char *start = p;
+            while (*p && *p != ' ' && *p != '\t') p++;
+            char saved = *p;
+            *p = '\0';
+            list_push(tokens, strdup(start));
+            *p = saved;
+        }
+    }
+    fclose(lf);
 }
 
 /* ─── 命令行参数解析 ─── */
-static void parse_args(CliOptions *opts, int argc, char **argv) {
+static void parse_args(CliOptions *opts, const char *prog, int argc, char **argv) {
     memset(opts, 0, sizeof(*opts));
     opts->inputs = make_list();
     opts->include_dirs = make_list();
     opts->c51_model = MODEL_SMALL;
 
+    /* 阶段 1: 将 argv[1..] + @file 展开为扁平 token 列表 */
+    List *tokens = make_list();
     for (int i = 1; i < argc; i++) {
-        const char *a = argv[i];
+        if (argv[i][0] == '@')
+            expand_argfile(argv[i] + 1, tokens);
+        else
+            list_push(tokens, strdup(argv[i]));
+    }
+
+    /* 阶段 2: 解析扁平 token 列表 */
+    int nt = list_len(tokens);
+    for (int i = 0; i < nt; i++) {
+        const char *a = list_get(tokens, i);
         if (!strcmp(a, "-o")) {
-            if (++i >= argc) die("-o needs arg");
-            opts->outfile = argv[i];
+            if (++i >= nt) die("-o needs arg");
+            opts->outfile = list_get(tokens, i);
         } else if (!strncmp(a, "-I", 2)) {
-            const char *p = a[2] ? a + 2 : (++i < argc ? argv[i] : NULL);
+            const char *p = a[2] ? a + 2 : (++i < nt ? list_get(tokens, i) : NULL);
             if (!p) die("-I needs arg");
             pp_global_add_include_path(p);
             list_push(opts->include_dirs, strdup(p));
         } else if (!strncmp(a, "-D", 2)) {
-            const char *def = a[2] ? a + 2 : (++i < argc ? argv[i] : NULL);
+            const char *def = a[2] ? a + 2 : (++i < nt ? list_get(tokens, i) : NULL);
             if (!def) die("-D needs arg");
             char name[256]; const char *val = "1";
             const char *eq = strchr(def, '=');
@@ -76,38 +114,30 @@ static void parse_args(CliOptions *opts, int argc, char **argv) {
             } else { strncpy(name, def, 255); name[255] = '\0'; }
             pp_global_define(name, val);
         } else if (!strcmp(a, "--target")) {
-            if (++i >= argc) die("--target needs arg");
-            const char *t = argv[i];
+            if (++i >= nt) die("--target needs arg");
+            const char *t = list_get(tokens, i);
             if (!strcmp(t, "mcs51") || !strcmp(t, "c51") || !strcmp(t, "8051") || !strcmp(t, "MCS51"))
                 opts->target = TGT_MCS51;
             else fprintf(stderr, "warning: unknown target '%s'\n", t);
         } else if (!strcmp(a, "--model")) {
-            if (++i >= argc) die("--model needs arg");
-            if (!strcmp(argv[i], "small")) opts->c51_model = MODEL_SMALL;
-            else if (!strcmp(argv[i], "compact")) opts->c51_model = MODEL_COMPACT;
-            else if (!strcmp(argv[i], "large")) opts->c51_model = MODEL_LARGE;
+            if (++i >= nt) die("--model needs arg");
+            if (!strcmp(list_get(tokens, i), "small")) opts->c51_model = MODEL_SMALL;
+            else if (!strcmp(list_get(tokens, i), "compact")) opts->c51_model = MODEL_COMPACT;
+            else if (!strcmp(list_get(tokens, i), "large")) opts->c51_model = MODEL_LARGE;
             else die("--model must be small, compact, or large");
         } else if (!strcmp(a, "--no-build")) {
             opts->no_build = true;
-        } else if (a[0] == '@') {
-            FILE *lf = fopen(a + 1, "r");
-            if (!lf) { fprintf(stderr, "error: cannot open '%s'\n", a + 1); exit(1); }
-            char line[4096];
-            while (fgets(line, sizeof(line), lf)) {
-                int len = (int)strlen(line);
-                while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r' || line[len-1] == ' '))
-                    line[--len] = '\0';
-                if (len > 0 && line[0] != '#')
-                    list_push(opts->inputs, strdup(line));
-            }
-            fclose(lf);
         } else if (a[0] == '-') {
-            usage(argv[0]); exit(1);
+            fprintf(stderr, "error: unknown option '%s'\n", a);
+            usage(prog); exit(1);
         } else {
             list_push(opts->inputs, strdup(a));
             if (!opts->first_input) opts->first_input = a;
         }
     }
+
+    /* 清理临时 token 列表（字符串本身由后续清理代码负责） */
+    free(tokens);
 }
 
 /* ─── 配置 MCS51 预处理宏 ─── */
@@ -205,7 +235,7 @@ static void build_hex_mode(const char *c51_path, const char *outfile,
 int main(int argc, char **argv) {
     init_console();
     CliOptions opts;
-    parse_args(&opts, argc, argv);
+    parse_args(&opts, argv[0], argc, argv);
     if (list_empty(opts.inputs)) { usage(argv[0]); return 1; }
 
     if (opts.target == TGT_MCS51)
