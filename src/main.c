@@ -209,7 +209,8 @@ static void output_source_mode(const char *c51_path, const char *outfile) {
 
 /* ─── 默认模式：调用 Keil 工具链生成 HEX ─── */
 static void build_hex_mode(const char *c51_path, const char *outfile,
-                           const char *first_input, int c51_model) {
+                           const char *first_input, int c51_model,
+                           List *include_dirs) {
     char hex_path[4096];
     const char *hex_out = outfile;
     if (!hex_out) {
@@ -226,7 +227,7 @@ static void build_hex_mode(const char *c51_path, const char *outfile,
     DWORD r2 = GetTempPathA(sizeof(tmp_dir), tmp_dir);
     if (r2 == 0 || r2 > sizeof(tmp_dir))
         strcpy(tmp_dir, "C:\\TEMP\\");
-    int ret = embed_run_toolchain(c51_path, first_input, hex_out, tmp_dir, c51_model);
+    int ret = embed_run_toolchain(c51_path, first_input, hex_out, tmp_dir, c51_model, include_dirs);
     _unlink(c51_path);
     if (ret) { fprintf(stderr, "error: toolchain failed\n"); exit(1); }
 }
@@ -249,7 +250,7 @@ int main(int argc, char **argv) {
     if (opts.no_build) {
         output_source_mode(c51_path, opts.outfile);
     } else {
-        build_hex_mode(c51_path, opts.outfile, opts.first_input, opts.c51_model);
+        build_hex_mode(c51_path, opts.outfile, opts.first_input, opts.c51_model, opts.include_dirs);
     }
 
     /* 清理 */

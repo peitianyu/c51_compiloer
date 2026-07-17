@@ -38,20 +38,31 @@ ttcc [选项] <输入文件.c>... | @<列表文件>
 | `--no-build` | 只输出 C51 源码到 stdout，不生成 HEX |
 | `@<file>` | 从文件读取参数（支持 `#` 注释，可混用命令行） |
 
-> **注意**：PowerShell 中 `@` 需转义：`` .\ttcc.exe `@list.txt ``
+> **注意**：PowerShell 中 `@` 需转义：使用 `--%`：`.\ttcc.exe --% @list.txt`
 
 ### 示例
 
 ```bash
-# 编译并生成 HEX
-ttcc --target mcs51 --model small -Idemo -o demo\demo.HEX demo\main.c demo\timer.c
+# 编译并生成 HEX（小规模演示）
+ttcc --target mcs51 --model small -Idemo -Iembed_toolchain\INC -o demo\demo.HEX demo\main.c demo\timer.c demo\uart.c demo\gpio.c
 
-# 仅查看翻译后的 C51 源码
-ttcc --target mcs51 --no-build demo/main.c
+# 编译实际项目（大型遥控器固件，56KB）
+ttcc --target mcs51 --model large -Iembed_toolchain\INC -Iloli3 -o out.hex loli3\main.c
 
 # 使用参数文件
-ttcc --% @list.txt 
+cd loli3
+ttcc --% @demo\list.txt
+
+# 仅查看翻译后的 C51 源码
+ttcc --target mcs51 --no-build -Idemo demo/main.c
 ```
+
+### 已测试项目
+
+| 项目 | 行数 | 内存模型 | 生成代码 | 状态 |
+|------|------|----------|----------|------|
+| `demo/` — 8051 综合演示（GPIO/UART/定时器） | ~200 | small | 1.9 KB | ✅ |
+| `loli3/` — 真实遥控器固件（NRF24L01/ADC/LCD/RC） | ~7000 | large | 56 KB | ✅ |
 
 ---
 
@@ -60,8 +71,18 @@ ttcc --% @list.txt
 ```
 C11 源码 → 预处理 → 词法/语法分析 → AST
     → 9 个降级 Pass → C51 代码生成
-    → [可选] C51.exe → BL51.exe → OH51.exe → .HEX
+    → [可选] Keil C51 → BL51 → OH51 → .HEX
 ```
+
+### 工具链自动检测
+
+`embed_toolchain.c` 自动按优先级查找 C51 编译器：
+
+1. **`C:\Keil_v5\C51\BIN\`** — 系统安装的完整版（优先）
+2. **`C:\Keil\C51\BIN\`** — 旧版 Keil 安装路径
+3. **`embed_toolchain\bin\`** — 项目 bundle 的评估版（回退）
+
+> ⚠️ bundle 的 C51 是评估版，代码限制 **2KB**。如需编译大型项目，需在 `C:\Keil_v5\` 安装完整版 Keil C51，并将有效的 `TOOL.INI` 放置于 `C:\Keil_v5\TOOL.INI`。项目中的 `embed_toolchain\TOOLS.INI` 可作为模板参考。
 
 ### AST 降级 Pass
 

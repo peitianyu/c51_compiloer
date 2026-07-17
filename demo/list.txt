@@ -3,8 +3,8 @@
 --model small
 -Idemo
 -Iembed_toolchain\INC
--o demo\demo.HEX
-demo\main.c
-demo\timer.c
-demo\uart.c
-demo\gpio.c
+-o demo.HEX
+main.c
+timer.c
+uart.c
+gpio.c

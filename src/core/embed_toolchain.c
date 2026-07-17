@@ -4,6 +4,8 @@
 #include <string.h>
 #include <windows.h>
 #include <io.h>
+#include "list.h"
+#include "dict.h"
 
 /*
  * embed_toolchain.c — 调用 Keil C51 工具链流水线
@@ -12,8 +14,17 @@
  * 依次调用编译 → 链接 → HEX 转换流水线。
  */
 
-/* ── 获取 embed_toolchain/bin 路径（相对于 ttcc.exe）── */
+/* ── 检测已安装的 Keil C51 bin 路径 ── */
+/* 优先级: 1) 系统安装的 C:\Keil_v5\C51\BIN\             */
+/*         2) 系统安装的 C:\Keil\C51\BIN\                 */
+/*         3) bundle 的 embed_toolchain\bin\（评估版回退）*/
 static const char *detect_keil_bin(void) {
+    /* 先检查系统安装的完整版 */
+    if (_access("C:\\Keil_v5\\C51\\BIN\\C51.exe", 0) == 0)
+        return "C:\\Keil_v5\\C51\\BIN";
+    if (_access("C:\\Keil\\C51\\BIN\\C51.exe", 0) == 0)
+        return "C:\\Keil\\C51\\BIN";
+    /* 回退到 bundle 的 embed_toolchain/bin */
     static char keil_bin_buf[4096];
     GetModuleFileNameA(NULL, keil_bin_buf, sizeof(keil_bin_buf));
     char *p = strrchr(keil_bin_buf, '\\');
@@ -23,8 +34,14 @@ static const char *detect_keil_bin(void) {
     return keil_bin_buf;
 }
 
-/* ── 获取 embed_toolchain 根目录（bin/ 的父目录）── */
+/* ── 获取 embed_toolchain/C51 根目录 ── */
 static const char *detect_keil_root(void) {
+    /* 系统安装的完整版 */
+    if (_access("C:\\Keil_v5\\C51\\BIN\\C51.exe", 0) == 0)
+        return "C:\\Keil_v5\\C51";
+    if (_access("C:\\Keil\\C51\\BIN\\C51.exe", 0) == 0)
+        return "C:\\Keil\\C51";
+    /* 回退 bundle 版 */
     static char root_buf[4096];
     strncpy(root_buf, detect_keil_bin(), sizeof(root_buf) - 1);
     char *p = strrchr(root_buf, '\\');
@@ -206,7 +223,8 @@ static const char *extract_program_size(const char *log_file) {
 /* ── 主流程：编译 → 链接 → 转换 HEX ── */
 int embed_run_toolchain(const char *source_file, const char *source_label,
                         const char *hex_out,
-                        const char *temp_dir, int c51_model) {
+                        const char *temp_dir, int c51_model,
+                        List *include_dirs) {
     (void)temp_dir;
     if (!source_file || !*source_file) return -1;
 

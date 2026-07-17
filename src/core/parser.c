@@ -1970,8 +1970,28 @@ static Ast *read_decl_array_init_recurse(Ctype *ctype)
         }
 
         Ast *one_row;
-        if (ctype->ptr->type == CTYPE_ARRAY)
-            one_row = read_decl_array_init_recurse(ctype->ptr);
+        if (ctype->ptr->type == CTYPE_ARRAY) {
+            /* 支持 brace elision（花括号省略）：如果内层数组没有 '{'，则读取标量值填充 */
+            if (is_punct(peek_token(), '{')) {
+                one_row = read_decl_array_init_recurse(ctype->ptr);
+            } else {
+                /* Brace elision: 读取 inner_n 个标量值构造内层数组 */
+                int inner_n = array_n_elts(ctype->ptr);
+                List *inner_list = make_list();
+                for (int ii = 0; ii < inner_n; ii++) {
+                    if (is_punct(peek_token(), '}'))
+                        break;
+                    Ast *val = read_expr();
+                    list_push(inner_list, val);
+                    if (ii + 1 < inner_n && is_punct(peek_token(), ','))
+                        read_token(); /* 消耗内层逗号 */
+                }
+                /* 用零填充剩余元素 */
+                while (list_len(inner_list) < inner_n)
+                    list_push(inner_list, make_zero_init(ctype->ptr->ptr));
+                one_row = ast_array_init(inner_list);
+            }
+        }
         else if (ctype->ptr->type == CTYPE_STRUCT) {
             if (is_punct(peek_token(), '{'))
                 one_row = read_decl_struct_init(ctype->ptr);
@@ -2896,6 +2916,19 @@ static Ctype *read_decl_spec(void)
             error("_Thread_local is not supported on MCS-51 target (no threading)");
     }
 
+    if (!ctype) {
+        /* 如果标识符未识别为类型，检查是否可能是隐式 int（如 "main()" 是 K&R 风格） */
+        if (get_ttype(tok) == TTYPE_IDENT) {
+            Token nxt = peek_token();
+            if (is_punct(nxt, '(')) {
+                /* 例如 main(...) — 隐式 int */
+                unget_token(tok);
+                ctype = ctype_int;
+                attr = 0; /* 无属性 */
+            }
+        }
+    }
+
     if (!ctype) 
         error("Type expected, but got %s", token_to_string(tok));
         
@@ -3196,15 +3229,23 @@ static Ast *read_decl_init_single(Ast *var)
     return ast_decl(var, NULL);
 }
 
-static Ast *read_global_decl_multi(Ctype *ctype, char *first_ident)
+static Ast *read_global_decl_multi(Ctype *ctype, char *first_ident, Ctype *first_ctype_with_dims)
 {
     List *decls = make_list();
     Ctype *base_ctype = ctype;
     char *ident = first_ident;
-    Ctype *ident_ctype = base_ctype;
+    Ctype *ident_ctype = first_ctype_with_dims ? first_ctype_with_dims : base_ctype;
+    bool first = true;
 
     while (1) {
-        Ctype *var_ctype = read_array_dimensions(ident_ctype);
+        Ctype *var_ctype;
+        if (first && first_ctype_with_dims) {
+            /* 第一个变量的数组维度已由上层消费，直接使用 */
+            var_ctype = first_ctype_with_dims;
+            first = false;
+        } else {
+            var_ctype = read_array_dimensions(ident_ctype);
+        }
         Ast *var = ast_gvar(var_ctype, ident, false);
         Ast *decl = read_decl_init_single(var);
         list_push(decls, decl);
@@ -3658,7 +3699,7 @@ static Ast *read_stmt(void)
     if (is_ident(tok, "_Static_assert"))  { read_token(); return read_static_assert_stmt(); }
     if (is_punct(tok, '{'))      { read_token(); return read_compound_stmt(); }
 
-    Ast *r = read_expr();
+    Ast *r = read_comma_expr();
     if(r->type != AST_LABEL) expect(';');
     return r;
 }
@@ -4172,6 +4213,15 @@ static Ast *read_decl_or_func_def(void)
     if ((g_last_c51_decl_kind == C51_DECL_SFR || g_last_c51_decl_kind == C51_DECL_SFR16 ||
          g_last_c51_decl_kind == C51_DECL_SBIT) && is_punct(peek_token(), '=')) {
         Ast *var = ast_gvar(ctype, ident, false);
+        if (g_last_c51_decl_kind == C51_DECL_SBIT) {
+            /* sbit 的 '^' 是位位置运算符，不是异或。
+             * 直接读取表达式，不进行编译时求值。 */
+            read_token(); /* consume '=' */
+            Ast *init = read_expr();
+            expect(';');
+            if (var->type == AST_GVAR) var->ginit = init;
+            return ast_decl(var, init);
+        }
         return read_decl_init(var);
     }
 
@@ -4210,28 +4260,31 @@ static Ast *read_decl_or_func_def(void)
     }
     if (ctype->type == CTYPE_VOID)
         error("Storage size of '%s' is not known", token_to_string(tok1));
-    ctype = read_array_dimensions(ctype);
+    Ctype *ctype_with_dims = read_array_dimensions(ctype);
     tok = peek_token();  /* re-peek after consuming array dimensions */
     if (is_punct(tok, '=') || is_punct(tok, ';') || is_punct(tok, ',')) {
-        if (is_punct(tok, ',')) {
-            return read_global_decl_multi(ctype, ident);
+        if (is_punct(tok, ',') || is_punct(tok, '=')) {
+            /* 多变量声明（含初始化）以及带初始化的单变量：
+             * 传给 read_global_decl_multi 基础类型（不含已消耗的数组维度），
+             * 由它统一处理每个变量的数组维度和初始化 */
+            return read_global_decl_multi(ctype, ident, ctype_with_dims);
         }
         if (is_punct(tok, ';')) {
-            if (get_attr(ctype->attr).ctype_typedef) {
-                dict_put(typedefenv, ident, ctype);
+            if (get_attr(ctype_with_dims->attr).ctype_typedef) {
+                dict_put(typedefenv, ident, ctype_with_dims);
                 read_token();
-                return ast_typedef(ctype, ident);
+                return ast_typedef(ctype_with_dims, ident);
             }
             read_token();
-            Ast *var = ast_gvar(ctype, ident, false);
+            Ast *var = ast_gvar(ctype_with_dims, ident, false);
             return ast_decl(var, NULL);
         }
-        /* '=' or CTYPE_ARRAY */
-        Ast *var = ast_gvar(ctype, ident, false);
+        /* '=' 初始化 */
+        Ast *var = ast_gvar(ctype_with_dims, ident, false);
         return read_decl_init(var);
     }
-    if (ctype->type == CTYPE_ARRAY) {
-        Ast *var = ast_gvar(ctype, ident, false);
+    if (ctype_with_dims->type == CTYPE_ARRAY) {
+        Ast *var = ast_gvar(ctype_with_dims, ident, false);
         return read_decl_init(var);
     }
     error("Don't know how to handle %s", token_to_string(tok));

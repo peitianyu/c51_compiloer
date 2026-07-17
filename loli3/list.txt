@@ -1,0 +1,7 @@
+# ttcc 编译配置
+--target mcs51
+--model large
+-Iloli3
+-Iembed_toolchain\INC
+-o out.HEX
+main.c

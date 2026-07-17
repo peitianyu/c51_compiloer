@@ -9,6 +9,7 @@
  */
 
 #include <stdio.h>
+#include "list.h"
 
 /* ── 工具链调用 ── */
 
@@ -23,6 +24,7 @@
  */
 int embed_run_toolchain(const char *source_file, const char *source_label,
                         const char *hex_out,
-                        const char *temp_dir, int c51_model);
+                        const char *temp_dir, int c51_model,
+                        List *include_dirs);
 
 #endif /* EMBED_TOOLCHAIN_H */
