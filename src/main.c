@@ -173,7 +173,7 @@ static List *compile_all(List *inputs, List *include_dirs, int target, int c51_m
 }
 
 /* ─── 生成 C51 源码到临时文件 ─── */
-static char *generate_c51_source(List *all_toplevels, int c51_model) {
+static char *generate_c51_source(List *all_toplevels, int c51_model, bool map_names) {
     char c51_dir[4096];
     DWORD ret = GetTempPathA(sizeof(c51_dir), c51_dir);
     if (ret == 0 || ret > sizeof(c51_dir))
@@ -185,7 +185,7 @@ static char *generate_c51_source(List *all_toplevels, int c51_model) {
     List *saved_strings = strings;
     List *saved_ctypes = ctypes;
     List *lowered = lower_program(all_toplevels, c51_model);
-    c51_emit_translation_unit(c51_out, lowered, c51_model);
+    c51_emit_translation_unit(c51_out, lowered, c51_model, map_names);
     fclose(c51_out);
     list_free(saved_strings);
     list_free(saved_ctypes);
@@ -242,9 +242,10 @@ int main(int argc, char **argv) {
     if (opts.target == TGT_MCS51)
         parser_set_target_mcs51();
 
-    /* 编译 → C51 源码 */
+    /* 编译 → C51 源码（--no-build 时保留中文名，HEX 构建时映射为 ASCII）*/
     List *all_toplevels = compile_all(opts.inputs, opts.include_dirs, opts.target, opts.c51_model);
-    char *c51_path = generate_c51_source(all_toplevels, opts.c51_model);
+    bool map_names = !opts.no_build;
+    char *c51_path = generate_c51_source(all_toplevels, opts.c51_model, map_names);
 
     /* 输出 */
     if (opts.no_build) {

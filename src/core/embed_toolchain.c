@@ -7,6 +7,67 @@
 #include "list.h"
 #include "dict.h"
 
+/* ── 从 C51 源码中解析中文→ASCII 名映射 ── */
+/* 映射格式（在 C51 文件末尾的注释中）：
+ *   /* __TTCC_NAME_MAP__ _cn_1=阶乘 _cn_2=初始化硬件 *​/
+ * 返回已分配的 Dict* (key=ASCII别名, val=中文原名) */
+static Dict *parse_name_map(const char *c51_source) {
+    Dict *map = make_dict(NULL);
+    FILE *f = fopen(c51_source, "r");
+    if (!f) return map;
+    char line[4096];
+    while (fgets(line, sizeof(line), f)) {
+        if (strstr(line, "__TTCC_NAME_MAP__")) {
+            char *p = strstr(line, "__TTCC_NAME_MAP__");
+            p += 18; /* skip past marker */
+            while (*p) {
+                while (*p == ' ' || *p == '\t' || *p == '*' || *p == '/') p++;
+                if (!*p || *p == '\n' || *p == '\r') break;
+                char alias[128], chinese[256];
+                if (sscanf(p, "%127[^=]=%255s", alias, chinese) == 2) {
+                    dict_put(map, strdup(alias), strdup(chinese));
+                    p += strlen(alias) + 1 + strlen(chinese);
+                } else break;
+            }
+            break;
+        }
+    }
+    fclose(f);
+    return map;
+}
+
+/* 根据别名查找中文原名
+ * C51/BL51 会对标识符做大写处理，且可能加/减下划线前缀，
+ * 所以需要多种尝试 */
+static const char *lookup_chinese(Dict *map, const char *alias) {
+    if (!map || !alias) return NULL;
+    /* 1) 精确匹配 */
+    {
+        const char *r = (const char*)dict_get(map, alias);
+        if (r) return r;
+    }
+    /* 2) 大小写不敏感匹配 */
+    for (int i = 0; i < list_len(map->list); i++) {
+        DictEntry *e = (DictEntry*)list_get(map->list, i);
+        if (e->key && _stricmp(e->key, alias) == 0)
+            return (const char*)e->val;
+    }
+    /* 3) 逐级去掉前导 _ 再试（如 __CN_3 → _CN_3 → CN_3）*/
+    const char *p = alias;
+    while (*p == '_') {
+        p++;
+        /* 精确匹配 */
+        { const char *r = (const char*)dict_get(map, p); if (r) return r; }
+        /* 大小写不敏感 */
+        for (int i = 0; i < list_len(map->list); i++) {
+            DictEntry *e = (DictEntry*)list_get(map->list, i);
+            if (e->key && _stricmp(e->key, p) == 0)
+                return (const char*)e->val;
+        }
+    }
+    return NULL;
+}
+
 static const char *detect_keil_bin(void) {
     {
         static char keil_bin_buf[4096];
@@ -78,7 +139,7 @@ static void set_color(int c) {
 }
 
 /* ── 打印 C51 警告摘要，带颜色和中文描述 ── */
-static void print_c51_warnings(const char *log_file, const char *source_label) {
+static void print_c51_warnings(const char *log_file, const char *source_label, Dict *name_map) {
     FILE *f = fopen(log_file, "r");
     if (!f) return;
     char line[1024];
@@ -145,9 +206,16 @@ static void print_c51_warnings(const char *log_file, const char *source_label) {
             snprintf(cn, sizeof(cn), "%s", desc);
 
         set_color(is_err ? CLR_ERROR : CLR_WARNING);
-        if (func[0])
-            fprintf(stdout, "  %s %s: '%s': %s\n",
-                    is_err ? "ERROR" : "WARNING", source_label, func, cn);
+        if (func[0]) {
+            /* 尝试反向查找中文原名 */
+            const char *cn_func = name_map ? lookup_chinese(name_map, func) : NULL;
+            if (cn_func)
+                fprintf(stdout, "  %s %s: '%s'(%s): %s\n",
+                        is_err ? "ERROR" : "WARNING", source_label, func, cn_func, cn);
+            else
+                fprintf(stdout, "  %s %s: '%s': %s\n",
+                        is_err ? "ERROR" : "WARNING", source_label, func, cn);
+        }
         else
             fprintf(stdout, "  %s %s: %s\n",
                     is_err ? "ERROR" : "WARNING", source_label, cn);
@@ -156,8 +224,8 @@ static void print_c51_warnings(const char *log_file, const char *source_label) {
     fclose(f);
 }
 
-/* ── 打印链接器警告/错误（带中文翻译）── */
-static void print_linker_warnings(const char *log_file) {
+/* ── 打印链接器警告/错误（带中文翻译 + 中文名反向查找）── */
+static void print_linker_warnings(const char *log_file, Dict *name_map) {
     FILE *f = fopen(log_file, "r");
     if (!f) return;
     char line[1024], next[1024];
@@ -206,9 +274,15 @@ static void print_linker_warnings(const char *log_file) {
         }
 
         set_color(is_err ? CLR_ERROR : CLR_WARNING);
-        if (sym[0])
-            fprintf(stdout, "  %s: '%s': %s\n",
-                    is_err ? "ERROR" : "WARNING", sym, desc);
+        if (sym[0]) {
+            const char *cn_sym = name_map ? lookup_chinese(name_map, sym) : NULL;
+            if (cn_sym)
+                fprintf(stdout, "  %s: '%s'(%s): %s\n",
+                        is_err ? "ERROR" : "WARNING", sym, cn_sym, desc);
+            else
+                fprintf(stdout, "  %s: '%s': %s\n",
+                        is_err ? "ERROR" : "WARNING", sym, desc);
+        }
         else
             fprintf(stdout, "  %s: %s\n",
                     is_err ? "ERROR" : "WARNING", desc);
@@ -257,6 +331,9 @@ int embed_run_toolchain(const char *source_file, const char *source_label,
     char log[512];
     snprintf(log, sizeof(log), "%s\\ttcc_log.txt", temp_dir);
 
+    /* 解析中文→ASCII 名映射 */
+    Dict *name_map = parse_name_map(source_file);
+
     /* C51: 编译（OBJECT 必须带 .OBJ 后缀）*/
     {
         char obj_with_ext[512];
@@ -292,7 +369,7 @@ int embed_run_toolchain(const char *source_file, const char *source_label,
             set_color(ne ? CLR_ERROR : CLR_WARNING);
             fprintf(stdout, "  %d warning(s), %d error(s)\n", nw, ne);
             set_color(CLR_DEFAULT);
-            print_c51_warnings(log, source_label ? source_label : source_file);
+            print_c51_warnings(log, source_label ? source_label : source_file, name_map);
         }
         _unlink(log);
     }
@@ -326,16 +403,26 @@ int embed_run_toolchain(const char *source_file, const char *source_label,
         char args[8192];
         snprintf(args, sizeof(args), "\"%s\",\"%s\\STARTUP.OBJ\",\"%s\\INIT.OBJ\",\"%s\",\"%s\" TO \"%s\"",
                  obj_abs, cwd, cwd, lib_path, fplib_path, abs_abs);
+        /* 优先使用本地嵌入的 BL51 */
+        char bl51_path[512];
+        snprintf(bl51_path, sizeof(bl51_path), "%s\\BL51.EXE", keil_bin);
         char cmd[8192];
-        snprintf(cmd, sizeof(cmd), "cmd.exe /C \"\"%s\\%s\" %s\" >\"%s\" 2>&1",
-                 keil_bin, "BL51.EXE", args, log);
+        snprintf(cmd, sizeof(cmd), "cmd.exe /C \"\"%s\" %s\" >\"%s\" 2>&1",
+                 bl51_path, args, log);
         int ret = system(cmd);
+        /* 若失败（可能代码超过 2KB 限制），改用 C:\Keil_v5\C51\BIN\BL51.EXE */
+        if (ret && ret != 1 && _access("C:\\Keil_v5\\C51\\BIN\\BL51.EXE", 0) == 0) {
+            snprintf(bl51_path, sizeof(bl51_path), "C:\\Keil_v5\\C51\\BIN\\BL51.EXE");
+            snprintf(cmd, sizeof(cmd), "cmd.exe /C \"\"%s\" %s\" >\"%s\" 2>&1",
+                     bl51_path, args, log);
+            ret = system(cmd);
+        }
         if (ret && ret != 1) {
             fprintf(stdout, "error: BL51 failed (exit %d)\n", ret);
             _unlink(log);
             return -1;
         }
-        print_linker_warnings(log);
+        print_linker_warnings(log, name_map);
         const char *size = extract_program_size(log);
         if (size) {
             char size_trim[256];

@@ -1086,12 +1086,12 @@ static char *read_logical_line(PPContext *ctx, InputFile *f)
 
 static inline bool is_ident_start(char c)
 {
-    return isalpha((unsigned char)c) || c == '_';
+    return isalpha((unsigned char)c) || c == '_' || (unsigned char)c >= 0x80;
 }
 
 static inline bool is_ident_char(char c)
 {
-    return isalnum((unsigned char)c) || c == '_';
+    return isalnum((unsigned char)c) || c == '_' || (unsigned char)c >= 0x80;
 }
 
 static inline char *string_steal(String *s)

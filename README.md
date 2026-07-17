@@ -78,11 +78,29 @@ C11 源码 → 预处理 → 词法/语法分析 → AST
 
 `embed_toolchain.c` 自动按优先级查找 C51 编译器：
 
-1. **`C:\Keil_v5\C51\BIN\`** — 系统安装的完整版（优先）
-2. **`C:\Keil\C51\BIN\`** — 旧版 Keil 安装路径
-3. **`embed_toolchain\bin\`** — 项目 bundle 的评估版（回退）
+1. **`Keil_v5\C51\BIN\`** — 项目内嵌版（优先使用，代码 ≤ 2KB）
+2. **`C:\Keil_v5\C51\BIN\`** — 系统安装的完整版（代码超过 2KB 时自动回退）
 
-> ⚠️ bundle 的 C51 是评估版，代码限制 **2KB**。如需编译大型项目，需在 `C:\Keil_v5\` 安装完整版 Keil C51，并将有效的 `TOOL.INI` 放置于 `C:\Keil_v5\TOOL.INI`。项目中的 `embed_toolchain\TOOLS.INI` 可作为模板参考。
+> ⚠️ 项目内嵌的 C51 是评估版，代码限制 **2KB**。如需编译大型项目，需在 `C:\Keil_v5\` 安装完整版 Keil C51，并将有效的 `TOOLS.INI` 放置于 `C:\Keil_v5\TOOLS.INI`（项目中的 `Keil_v5\TOOLS.INI` 可作为模板参考）。
+>
+> **默认安装位置**：Keil C51 需安装到 `C:\Keil_v5\` 才能被自动检测。若安装在其他路径，请创建符号链接或调整 `embed_toolchain.c` 中的检测逻辑。
+
+---
+
+## 中文标识符支持
+
+ttcc 支持 **UTF-8 中文标识符**（变量名、函数名、函数参数等），例如：
+
+```c
+int 计数器 = 0;
+void 初始化硬件(void) { ... }
+static unsigned long 阶乘(unsigned int 参数) { ... }
+```
+
+- **`--no-build` 模式**：输出的 C51 源码保留原始中文名
+- **完整 HEX 构建**：中文名自动映射为 ASCII 别名（如 `_cn_1`），生成的 HEX 与英文标识符版本一致
+- **错误提示**：Keil 报错时自动反向查找中文原名，如 `WARNING: '__CN_3'(乘): 段未被调用，已丢弃`
+- **前提条件**：源文件必须保存为 **UTF-8 编码**（不含 BOM）
 
 ### AST 降级 Pass
 

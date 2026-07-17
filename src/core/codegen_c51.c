@@ -19,6 +19,46 @@ static Dict *g_emitted_typedef = NULL;
 /* 已发射的函数声明名称（去重用）*/
 static Dict *g_emitted_funcdecl = NULL;
 
+/* ── 中文→ASCII 标识符映射 ── */
+/* key=ASCII别名, val=中文原名, 如 "_CN_1" → "阶乘"  */
+static Dict *g_name_map = NULL;
+static int g_name_counter = 0;
+static bool g_map_names_enabled = true;
+
+/* 若 map_names=true 且名字含非 ASCII 字符，返回 ASCII 别名；
+ * 否则原样返回。 */
+static const char *c51_map_name(const char *name) {
+    if (!name || !g_map_names_enabled) return name;
+    bool has_non_ascii = false;
+    for (const unsigned char *p = (const unsigned char*)name; *p; p++) {
+        if (*p >= 0x80) { has_non_ascii = true; break; }
+    }
+    if (!has_non_ascii) return name;
+
+    /* 正查：已有别名则直接返回 */
+    if (g_name_map) {
+        /* dict_get 按 key 查询，这里需要 val→key 反查，所以遍历 */
+        for (int i = 0; i < list_len(g_name_map->list); i++) {
+            DictEntry *e = (DictEntry*)list_get(g_name_map->list, i);
+            if (e->val && !strcmp((const char*)e->val, name))
+                return e->key;
+        }
+    }
+    /* 生成新别名 _CN_N */
+    char alias[64];
+    snprintf(alias, sizeof(alias), "_CN_%d", ++g_name_counter);
+    if (!g_name_map) g_name_map = make_dict(NULL);
+    dict_put(g_name_map, strdup(alias), strdup(name));
+    /* 返回持久化的别名（已存入 dict，其 key 是持久化的） */
+    for (int i = 0; i < list_len(g_name_map->list); i++) {
+        DictEntry *e = (DictEntry*)list_get(g_name_map->list, i);
+        if (!strcmp(e->key, alias)) return e->key;
+    }
+    return NULL; /* unreachable */
+}
+
+Dict *c51_get_name_map(void) { return g_name_map; }
+
 static void c51_emit_decl(FILE *out, Ast *ast);
 static void c51_emit_init(FILE *out, Ast *init);
 static void c51_emit_stmt(FILE *out, Ast *ast, int indent);
@@ -130,7 +170,7 @@ static void c51_emit_struct_def(FILE *out, Ctype *ctype) {
         c51_emit_type_prefix(out, ft);
         fprintf(out, " ");
         c51_emit_ptr_prefix(out, ft);
-        fprintf(out, "%s", fname);
+        fprintf(out, "%s", c51_map_name(fname));
         if (ft->bit_size > 0) fprintf(out, " : %d", ft->bit_size);
         c51_emit_array_suffix(out, ft);
         fprintf(out, ";\n");
@@ -152,15 +192,15 @@ static void c51_emit_sfr_decl(FILE *out, Ast *ast) {
     if (ast->declinit->type == AST_LITERAL)
         addr = (unsigned long)ast->declinit->ival;
     if (a.ctype_c51_sfr)
-        fprintf(out, "sfr  %s = 0x%02lX;\n", ast->declvar->varname, addr);
+        fprintf(out, "sfr  %s = 0x%02lX;\n", c51_map_name(ast->declvar->varname), addr);
     else if (a.ctype_c51_sfr16)
-        fprintf(out, "sfr16 %s = 0x%04lX;\n", ast->declvar->varname, addr);
+        fprintf(out, "sfr16 %s = 0x%04lX;\n", c51_map_name(ast->declvar->varname), addr);
     else if (a.ctype_c51_sbit) {
         if (ast->declinit->type == AST_LITERAL)
-            fprintf(out, "sbit %s = 0x%02lX;\n", ast->declvar->varname, addr);
+            fprintf(out, "sbit %s = 0x%02lX;\n", c51_map_name(ast->declvar->varname), addr);
         else {
             /* sbit 表达式（例如 P0^6）：直接输出表达式 */
-            fprintf(out, "sbit %s = ", ast->declvar->varname);
+            fprintf(out, "sbit %s = ", c51_map_name(ast->declvar->varname));
             c51_emit_expr(out, ast->declinit);
             fprintf(out, ";\n");
         }
@@ -177,7 +217,7 @@ static void c51_emit_decl(FILE *out, Ast *ast) {
     }
     if (a.ctype_c51_bit) {
         c51_emit_memory_attr(out, a);
-        fprintf(out, "bit %s", ast->declvar->varname);
+        fprintf(out, "bit %s", c51_map_name(ast->declvar->varname));
         if (ast->declinit) { fprintf(out, " = "); c51_emit_expr(out, ast->declinit); }
         fprintf(out, ";\n"); return;
     }
@@ -186,12 +226,12 @@ static void c51_emit_decl(FILE *out, Ast *ast) {
         /* 匿名 struct：必须内联展开定义 */
         c51_emit_memory_attr(out, a);
         c51_emit_struct_def(out, ct);
-        fprintf(out, " %s", ast->declvar->varname);
+        fprintf(out, " %s", c51_map_name(ast->declvar->varname));
     } else {
         c51_emit_type_prefix(out, ct);
         fprintf(out, " ");
         c51_emit_ptr_prefix(out, ct);
-        fprintf(out, "%s", ast->declvar->varname);
+        fprintf(out, "%s", c51_map_name(ast->declvar->varname));
         c51_emit_array_suffix(out, ct);
     }
     if (ast->declinit) {
@@ -268,7 +308,7 @@ static void c51_emit_func_def(FILE *out, Ast *ast) {
     } else {
         fprintf(out, "void ");
     }
-    fprintf(out, "%s(", ast->fname);
+    fprintf(out, "%s(", c51_map_name(ast->fname));
     if (ast->params) {
         for (int i = 0; i < list_len(ast->params); i++) {
             Ast *p = (Ast*)list_get(ast->params, i);
@@ -278,7 +318,7 @@ static void c51_emit_func_def(FILE *out, Ast *ast) {
                 fprintf(out, " ");
                 c51_emit_ptr_prefix(out, p->ctype);
                 if (p->varname) {
-                    fprintf(out, "%s", p->varname);
+                    fprintf(out, "%s", c51_map_name(p->varname));
                     c51_emit_array_suffix(out, p->ctype);
                 }
             }
@@ -299,7 +339,7 @@ static void c51_emit_func_decl(FILE *out, Ast *ast) {
         fprintf(out, " ");
         c51_emit_ptr_prefix(out, ast->ctype);
     }
-    fprintf(out, "%s(", ast->fname);
+    fprintf(out, "%s(", c51_map_name(ast->fname));
     if (ast->params) {
         for (int i = 0; i < list_len(ast->params); i++) {
             Ast *p = (Ast*)list_get(ast->params, i);
@@ -309,7 +349,7 @@ static void c51_emit_func_decl(FILE *out, Ast *ast) {
                 fprintf(out, " ");
                 c51_emit_ptr_prefix(out, p->ctype);
                 if (p->varname) {
-                    fprintf(out, "%s", p->varname);
+                    fprintf(out, "%s", c51_map_name(p->varname));
                     c51_emit_array_suffix(out, p->ctype);
                 }
             }
@@ -453,10 +493,10 @@ static void c51_emit_stmt(FILE *out, Ast *ast, int indent) {
         fprintf(out, ";\n");
         break;
     case AST_LABEL:
-        fprintf(out, "%s:\n", ast->label);
+        fprintf(out, "%s:\n", c51_map_name(ast->label));
         break;
     case AST_GOTO:
-        fprintf(out, "goto %s;\n", ast->label);
+        fprintf(out, "goto %s;\n", c51_map_name(ast->label));
         break;
     case AST_BREAK:
         fprintf(out, "break;\n");
@@ -518,8 +558,8 @@ static void c51_emit_expr(FILE *out, Ast *ast) {
         default: fprintf(out, "%lld", ast->ival); break;
         } break;
     case AST_STRING: c51_emit_escaped_string(out, ast->sval); break;
-    case AST_LVAR: case AST_GVAR: fprintf(out, "%s", ast->varname ? ast->varname : "?"); break;
-    case AST_FUNC_DECL: case AST_FUNC_DEF: fprintf(out, "%s", ast->fname ? ast->fname : "?"); break;
+    case AST_LVAR: case AST_GVAR: fprintf(out, "%s", c51_map_name(ast->varname)); break;
+    case AST_FUNC_DECL: case AST_FUNC_DEF: fprintf(out, "%s", c51_map_name(ast->fname)); break;
     case AST_FUNCALL:
         if (ast->fnexpr) {
             /* 函数指针调用需要括号包裹 */
@@ -530,7 +570,7 @@ static void c51_emit_expr(FILE *out, Ast *ast) {
                 fprintf(out, "("); c51_emit_expr(out, ast->fnexpr); fprintf(out, ")");
             }
         }
-        else fprintf(out, "%s", ast->fname ? ast->fname : "?");
+        else fprintf(out, "%s", c51_map_name(ast->fname));
         fprintf(out, "(");
         if (ast->args) for (int i = 0; i < list_len(ast->args); i++) {
             if (i > 0) fprintf(out, ", ");
@@ -682,14 +722,14 @@ static void c51_emit_toplevel(FILE *out, Ast *ast) {
                     fprintf(out, "\n");
                 }
                 free(keys);
-                fprintf(out, "} %s;\n", ast->typename);
+                fprintf(out, "} %s;\n", c51_map_name(ast->typename));
             } else if (ast->ctype->type == CTYPE_STRUCT) {
                 /* typedef struct { ... } Name; */
                 c51_emit_struct_def(out, ast->ctype);
-                fprintf(out, " %s;\n", ast->typename);
+                fprintf(out, " %s;\n", c51_map_name(ast->typename));
             } else {
                 c51_emit_type_prefix(out, ast->ctype);
-                fprintf(out, " %s", ast->typename);
+                fprintf(out, " %s", c51_map_name(ast->typename));
                 c51_emit_ptr_prefix(out, ast->ctype);
                 c51_emit_array_suffix(out, ast->ctype);
                 fprintf(out, ";\n");
@@ -700,7 +740,7 @@ static void c51_emit_toplevel(FILE *out, Ast *ast) {
             c51_emit_type_prefix(out, ast->declvar->ctype);
             fprintf(out, " ");
             c51_emit_ptr_prefix(out, ast->declvar->ctype);
-            fprintf(out, "%s", ast->declvar->varname);
+            fprintf(out, "%s", c51_map_name(ast->declvar->varname));
             c51_emit_array_suffix(out, ast->declvar->ctype);
             fprintf(out, ";\n");
         } break;
@@ -730,8 +770,9 @@ static void c51_emit_toplevel(FILE *out, Ast *ast) {
     }
 }
 
-void c51_emit_translation_unit(FILE *out, List *toplevels, int c51_model) {
+void c51_emit_translation_unit(FILE *out, List *toplevels, int c51_model, bool map_names) {
     g_c51_mem_model = c51_model;
+    g_map_names_enabled = map_names;
     /* 初始化去重表 */
     if (!g_emitted_sfr) g_emitted_sfr = make_dict(NULL);
     else dict_clear(g_emitted_sfr);
@@ -762,4 +803,14 @@ void c51_emit_translation_unit(FILE *out, List *toplevels, int c51_model) {
     if (!toplevels) return;
     for (int i = 0; i < list_len(toplevels); i++)
         c51_emit_toplevel(out, (Ast*)list_get(toplevels, i));
+
+    /* 输出中文→ASCII 标识符映射（供 embed_toolchain 反向查错用） */
+    if (g_name_map && list_len(g_name_map->list) > 0) {
+        fprintf(out, "\n/* __TTCC_NAME_MAP__");
+        for (int i = 0; i < list_len(g_name_map->list); i++) {
+            DictEntry *e = (DictEntry*)list_get(g_name_map->list, i);
+            fprintf(out, " %s=%s", e->key, (const char*)e->val);
+        }
+        fprintf(out, " */\n");
+    }
 }

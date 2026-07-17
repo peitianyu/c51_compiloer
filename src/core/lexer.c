@@ -269,7 +269,7 @@ static Token read_ident(char c)
     string_append(&s, c);
     while (1) {
         int c2 = getc_with_pos();
-        if (isalnum(c2) || c2 == '_') {
+        if (isalnum(c2) || c2 == '_' || c2 >= 0x80) {
             string_append(&s, c2);
         } else {
             ungetc_with_pos(c2);
@@ -606,6 +606,11 @@ static Token read_token_int(void)
         update_token_info(start_line, start_col, &tok);
         return tok;
     default:
+        if ((unsigned char)c >= 0x80) {
+            tok = read_ident(c);
+            update_token_info(start_line, start_col, &tok);
+            return tok;
+        }
         error("Unexpected character: '%c'", c);
         tok = make_null(); /* non-reachable */
         update_token_info(start_line, start_col, &tok);
