@@ -1,0 +1,18 @@
+# 构建产物
+*.hex
+*.HEX
+*.ABS
+*.OBJ
+*.M51
+*.obj
+*.lst
+*.map
+
+# 临时文件
+/tmp/
+/temp/
+
+# 项目目录排除
+.github/
+tests/
+ttcc
