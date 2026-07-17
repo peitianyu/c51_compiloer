@@ -5,8 +5,9 @@
  *   2. 通过 UART 输出启动信息
  *   3. 定时闪烁 LED（P1.0）
  *   4. 通过 UART 打印计数器值
+ *   5. 调用 C51 运行时库（math.h）
  *
- * 编译：ttcc --target mcs51 -o multi_file.c main.c timer.c uart.c gpio.c
+ * 编译：ttcc --target mcs51 -Idemo -o demo\demo.HEX demo\main.c demo\timer.c demo\uart.c demo\gpio.c
  */
 
 /* 声明外部函数 */
@@ -14,6 +15,7 @@
 #include "uart.h"
 #include "gpio.h"
 #include "reg8051.h"
+#include <math.h>
 
 /* 中断服务函数 */
 void isr_timer0(void) interrupt 1
@@ -58,6 +60,8 @@ void main(void)
     unsigned int i;
     unsigned long fact_result;
     unsigned int fib_result;
+    int abs_val;
+    float f, sqrt_val;
 
     /* 初始化 GPIO P1.0 为输出（LED）*/
     gpio_init_pin(0, 0);
@@ -88,6 +92,19 @@ void main(void)
         uart_send_hex(fib_result);
         uart_send_string("\r\n");
     }
+
+    /* 测试 C51 运行时库函数：abs() */
+    abs_val = abs(-42);
+    uart_send_string("abs(-42)=");
+    uart_send_hex((unsigned int)abs_val);
+    uart_send_string("\r\n");
+
+    /* 测试 C51 运行时库函数：sqrt() */
+    f = 25.0;
+    sqrt_val = sqrt(f);
+    uart_send_string("sqrt(25)=");
+    uart_send_hex((unsigned int)sqrt_val);
+    uart_send_string("\r\n");
 
     uart_send_string("All tests passed.\r\n");
 
