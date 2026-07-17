@@ -2494,7 +2494,7 @@ void initial()			 //?????
 }	
 	
 
-main()
+int main()
 {
 	int temp;u8 i;
 

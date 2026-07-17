@@ -2,7 +2,7 @@
 --target mcs51
 --model small
 -Idemo
--Iembed_toolchain\INC
+-IKeil_v5\C51\INC
 -o demo.HEX
 main.c
 timer.c

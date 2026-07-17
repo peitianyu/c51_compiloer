@@ -7,46 +7,34 @@
 #include "list.h"
 #include "dict.h"
 
-/*
- * embed_toolchain.c — 调用 Keil C51 工具链流水线
- *
- * 检测已安装的 Keil C51（C51.exe / BL51.EXE / OH51.EXE），
- * 依次调用编译 → 链接 → HEX 转换流水线。
- */
-
-/* ── 检测已安装的 Keil C51 bin 路径 ── */
-/* 优先级: 1) 系统安装的 C:\Keil_v5\C51\BIN\             */
-/*         2) 系统安装的 C:\Keil\C51\BIN\                 */
-/*         3) bundle 的 embed_toolchain\bin\（评估版回退）*/
 static const char *detect_keil_bin(void) {
-    /* 先检查系统安装的完整版 */
-    if (_access("C:\\Keil_v5\\C51\\BIN\\C51.exe", 0) == 0)
-        return "C:\\Keil_v5\\C51\\BIN";
-    if (_access("C:\\Keil\\C51\\BIN\\C51.exe", 0) == 0)
-        return "C:\\Keil\\C51\\BIN";
-    /* 回退到 bundle 的 embed_toolchain/bin */
-    static char keil_bin_buf[4096];
-    GetModuleFileNameA(NULL, keil_bin_buf, sizeof(keil_bin_buf));
-    char *p = strrchr(keil_bin_buf, '\\');
-    if (p) *p = '\0';
-    size_t len = strlen(keil_bin_buf);
-    snprintf(keil_bin_buf + len, sizeof(keil_bin_buf) - len, "\\embed_toolchain\\bin");
-    return keil_bin_buf;
+    {
+        static char keil_bin_buf[4096];
+        GetModuleFileNameA(NULL, keil_bin_buf, sizeof(keil_bin_buf));
+        char *p = strrchr(keil_bin_buf, '\\');
+        if (p) *p = '\0';
+        size_t len = strlen(keil_bin_buf);
+        snprintf(keil_bin_buf + len, sizeof(keil_bin_buf) - len, "\\Keil_v5\\C51\\BIN");
+        char c51_check[4096];
+        snprintf(c51_check, sizeof(c51_check), "%s\\C51.exe", keil_bin_buf);
+        if (_access(c51_check, 0) == 0)
+            return keil_bin_buf;
+    }
+    return NULL;
 }
 
 /* ── 获取 embed_toolchain/C51 根目录 ── */
 static const char *detect_keil_root(void) {
-    /* 系统安装的完整版 */
-    if (_access("C:\\Keil_v5\\C51\\BIN\\C51.exe", 0) == 0)
-        return "C:\\Keil_v5\\C51";
-    if (_access("C:\\Keil\\C51\\BIN\\C51.exe", 0) == 0)
-        return "C:\\Keil\\C51";
-    /* 回退 bundle 版 */
-    static char root_buf[4096];
-    strncpy(root_buf, detect_keil_bin(), sizeof(root_buf) - 1);
-    char *p = strrchr(root_buf, '\\');
-    if (p) *p = '\0';
-    return root_buf;
+    const char *bin = detect_keil_bin();
+    if (bin) {
+        static char root_buf[4096];
+        strncpy(root_buf, bin, sizeof(root_buf) - 1);
+        root_buf[sizeof(root_buf) - 1] = '\0';
+        char *p = strrchr(root_buf, '\\');
+        if (p) *p = '\0';
+        return root_buf;
+    }
+    return NULL;
 }
 
 /* ── 获取当前工作目录（用于 OBJ/ABS 生成位置）── */
@@ -103,6 +91,7 @@ static void print_c51_warnings(const char *log_file, const char *source_label) {
         char func[128] = "", desc[256] = "", cn[256] = "";
         char *p = strchr(line, '\'');
         if (p) {
+            /* 格式: *** WARNING file.c(123): 'function_name': description */
             p++;
             int i = 0;
             while (*p && *p != '\'' && i < 127) func[i++] = *p++;
@@ -113,6 +102,21 @@ static void print_c51_warnings(const char *log_file, const char *source_label) {
                 p[strcspn(p, "\r\n")] = 0;
                 while (*p && i < 255) desc[i++] = *p++;
                 desc[i] = '\0';
+            }
+        } else {
+            /* 无单引号格式: *** WARNING file.c(123): description */
+            /* 跳过 "WARNING" 前缀，提取冒号后的内容 */
+            p = strstr(line, "WARNING");
+            if (!p) p = strstr(line, "ERROR");
+            if (p) {
+                p = strchr(p, ':');
+                if (p) {
+                    p++;
+                    while (*p == ' ') p++;
+                    p[strcspn(p, "\r\n")] = 0;
+                    strncpy(desc, p, sizeof(desc) - 1);
+                    desc[sizeof(desc) - 1] = '\0';
+                }
             }
         }
         if (strstr(desc, "recursive call to non-reentrant function"))
@@ -141,8 +145,12 @@ static void print_c51_warnings(const char *log_file, const char *source_label) {
             snprintf(cn, sizeof(cn), "%s", desc);
 
         set_color(is_err ? CLR_ERROR : CLR_WARNING);
-        fprintf(stdout, "  %s %s: '%s': %s\n",
-                is_err ? "ERROR" : "WARNING", source_label, func, cn);
+        if (func[0])
+            fprintf(stdout, "  %s %s: '%s': %s\n",
+                    is_err ? "ERROR" : "WARNING", source_label, func, cn);
+        else
+            fprintf(stdout, "  %s %s: %s\n",
+                    is_err ? "ERROR" : "WARNING", source_label, cn);
         set_color(CLR_DEFAULT);
     }
     fclose(f);

@@ -15,4 +15,5 @@
 # 项目目录排除
 .github/
 tests/
-ttcc
+Keil_v5/TOOLS.INI
+Keil_v5/register.ps1

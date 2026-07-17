@@ -2,6 +2,6 @@
 --target mcs51
 --model large
 -Iloli3
--Iembed_toolchain\INC
+-IKeil_v5\C51\INC
 -o out.HEX
 main.c
