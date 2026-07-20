@@ -270,6 +270,9 @@ static bool lower_is_const_expr(Ast *ast) {
     case AST_TERNARY:
         return lower_is_const_expr(ast->cond) && lower_is_const_expr(ast->then) && lower_is_const_expr(ast->els);
     case AST_GVAR:
+        /* 静态局部变量（__sloc_）运行时可变，不可作为编译期常量 */
+        if (ast->varname && strncmp(ast->varname, "__sloc_", 7) == 0)
+            return false;
         /* 全局变量有常量初始化器才可视为常量 */
         if (ast->ginit) { 
             /* 简单类型可直接求值；struct/array 初始化器非整数常量 */

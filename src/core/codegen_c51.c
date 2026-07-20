@@ -526,11 +526,30 @@ static void c51_emit_stmt(FILE *out, Ast *ast, int indent) {
                         }
                         (void)found;
                         /* 输出来自 case wrapper 中的语句（跳过 label 本身）*/
+                        /* 对于嵌套的 AST_COMPOUND_STMT（如 case 3: default: stmt 产生），
+                         * 展平：递归跳过其内部的 label，直接输出非 label 语句 */
                         for (int j = 0; j < list_len(s->stmts); j++) {
                             Ast *inner = (Ast*)list_get(s->stmts, j);
                             if (inner->type == AST_LABEL) continue;
-                            c51_emit_indent(out, indent + 1);
-                            c51_emit_stmt(out, inner, indent + 1);
+                            /* 展平嵌套的纯-label compound_stmt */
+                            if (inner->type == AST_COMPOUND_STMT && inner->stmts) {
+                                bool has_only_labels = true;
+                                for (int k = 0; k < list_len(inner->stmts); k++) {
+                                    Ast *nested = (Ast*)list_get(inner->stmts, k);
+                                    if (nested->type == AST_LABEL) {
+                                        /* 嵌套 label 可能是 default_label */
+                                        if (ast->default_label && !strcmp(ast->default_label, nested->label))
+                                            fprintf(out, "default:\n");
+                                    } else {
+                                        /* 输出非 label 语句，缩进与外层一致 */
+                                        c51_emit_indent(out, indent + 1);
+                                        c51_emit_stmt(out, nested, indent + 1);
+                                    }
+                                }
+                            } else {
+                                c51_emit_indent(out, indent + 1);
+                                c51_emit_stmt(out, inner, indent + 1);
+                            }
                         }
                         continue;
                     }
