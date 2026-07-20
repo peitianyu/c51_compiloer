@@ -140,7 +140,7 @@ void main()
     unsigned long fact_result;
     unsigned int fib_result;
     int abs_val;
-        float f;
+    float f;
     float sqrt_val;
     gpio_init_pin(0, 0);
     gpio_set_pin(0, 0);

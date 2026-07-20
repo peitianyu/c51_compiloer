@@ -149,37 +149,31 @@ static void print_c51_warnings(const char *log_file, const char *source_label, D
             continue;
         bool is_err = (strstr(line, "ERROR") != NULL);
         if (!is_err && !strstr(line, "WARNING")) continue;
-        char func[128] = "", desc[256] = "", cn[256] = "";
-        char *p = strchr(line, '\'');
-        if (p) {
-            /* 格式: *** WARNING file.c(123): 'function_name': description */
-            p++;
-            int i = 0;
-            while (*p && *p != '\'' && i < 127) func[i++] = *p++;
-            func[i] = '\0';
-            p += 2;
-            if (*p) {
-                i = 0;
-                p[strcspn(p, "\r\n")] = 0;
-                while (*p && i < 255) desc[i++] = *p++;
-                desc[i] = '\0';
-            }
-        } else {
-            /* 无单引号格式: *** WARNING file.c(123): description */
-            /* 跳过 "WARNING" 前缀，提取冒号后的内容 */
-            p = strstr(line, "WARNING");
-            if (!p) p = strstr(line, "ERROR");
-            if (p) {
-                p = strchr(p, ':');
-                if (p) {
-                    p++;
-                    while (*p == ' ') p++;
-                    p[strcspn(p, "\r\n")] = 0;
-                    strncpy(desc, p, sizeof(desc) - 1);
-                    desc[sizeof(desc) - 1] = '\0';
-                }
+
+        /* 提取原始行中的文件名和行号: "IN LINE 346 OF build\file.51" */
+        char file_buf[256] = "", line_str[32] = "", desc[256] = "";
+        char *in_line = strstr(line, "IN LINE ");
+        if (in_line) {
+            in_line += 8;
+            char *p = in_line;
+            while (*p && isdigit((unsigned char)*p) && (p - in_line) < 31)
+                p++;
+            if (p > in_line) { int ln = (int)(p - in_line); strncpy(line_str, in_line, ln); line_str[ln] = '\0'; }
+            char *of = strstr(p, " OF ");
+            if (of) {
+                of += 4;
+                char *colon = strchr(of, ':');
+                if (colon) { int fn = (int)(colon - of); if (fn > 255) fn = 255; strncpy(file_buf, of, fn); file_buf[fn] = '\0'; }
+                /* 提取 description（冒号后的内容）*/
+                char *d = colon + 1;
+                while (*d == ' ') d++;
+                d[strcspn(d, "\r\n")] = 0;
+                strncpy(desc, d, sizeof(desc) - 1);
+                desc[sizeof(desc) - 1] = '\0';
             }
         }
+
+        char cn[256] = "";
         if (strstr(desc, "recursive call to non-reentrant function"))
             snprintf(cn, sizeof(cn), "不可重入函数递归调用");
         else if (strstr(desc, "UNRESOLVED EXTERNAL SYMBOL"))
@@ -200,61 +194,31 @@ static void print_c51_warnings(const char *log_file, const char *source_label, D
             snprintf(cn, sizeof(cn), "函数未被调用，已丢弃");
         else if (strstr(desc, "constant out of range"))
             snprintf(cn, sizeof(cn), "常量超出范围");
-        else if (strstr(desc, "unreachable code")) {
+        else if (strstr(desc, "unreachable code"))
             snprintf(cn, sizeof(cn), "不可达代码（常量条件分支）");
-        }
-        else {
-            /* 提取原始行中的文件名和行号: "IN LINE 346 OF build\file.51: desc" */
-            char file_buf[256] = "", line_str[32] = "";
-            char *in_line = strstr(line, "IN LINE ");
-            if (in_line) {
-                in_line += 8; /* 跳过 "IN LINE " */
-                char *p = in_line;
-                while (*p && isdigit((unsigned char)*p) && (p - in_line) < 31)
-                    p++;
-                if (p > in_line) {
-                    int ln = (int)(p - in_line);
-                    strncpy(line_str, in_line, ln);
-                    line_str[ln] = '\0';
-                }
-                char *of = strstr(p, " OF ");
-                if (of) {
-                    of += 4;
-                    char *colon = strchr(of, ':');
-                    if (colon) {
-                        int fn = (int)(colon - of);
-                        if (fn > 255) fn = 255;
-                        strncpy(file_buf, of, fn);
-                        file_buf[fn] = '\0';
-                    }
-                }
-            }
-            if (file_buf[0] && line_str[0]) {
-                fprintf(stdout, "  C51 WARNING: %s:%s: %s\n", file_buf, line_str, desc);
-            } else {
-                /* fallback: 打印原始行 */
-                char dbg[1024]; strncpy(dbg, line, 1023); dbg[1023]=0;
-                int dlen = strlen(dbg); while(dlen>0&&(dbg[dlen-1]=='\n'||dbg[dlen-1]=='\r')) dbg[--dlen]=0;
-                fprintf(stdout, "  C51 WARNING: %s\n", dbg);
-            }
-            continue;
-        }
-
-        set_color(is_err ? CLR_ERROR : CLR_WARNING);
-        if (func[0]) {
-            /* 尝试反向查找中文原名 */
-            const char *cn_func = name_map ? lookup_chinese(name_map, func) : NULL;
-            if (cn_func)
-                fprintf(stdout, "  %s %s: '%s'(%s): %s\n",
-                        is_err ? "ERROR" : "WARNING", source_label, func, cn_func, cn);
-            else
-                fprintf(stdout, "  %s %s: '%s': %s\n",
-                        is_err ? "ERROR" : "WARNING", source_label, func, cn);
-        }
         else
-            fprintf(stdout, "  %s %s: %s\n",
-                    is_err ? "ERROR" : "WARNING", source_label, cn);
-        set_color(CLR_DEFAULT);
+            snprintf(cn, sizeof(cn), "%s", desc);
+
+        if (file_buf[0] && line_str[0]) {
+            set_color(is_err ? CLR_ERROR : CLR_WARNING);
+            fprintf(stdout, "  %s %s:%s: %s\n",
+                    is_err ? "ERROR" : "WARNING", file_buf, line_str, cn);
+            set_color(CLR_DEFAULT);
+        } else {
+            /* fallback 无行号信息：原格式 */
+            char func[128] = "";
+            char *p = strchr(line, '\'');
+            if (p) {
+                p++;
+                int i = 0;
+                while (*p && *p != '\'' && i < 127) func[i++] = *p++;
+                func[i] = '\0';
+            }
+            set_color(is_err ? CLR_ERROR : CLR_WARNING);
+            fprintf(stdout, "  %s %s: '%s': %s\n",
+                    is_err ? "ERROR" : "WARNING", source_label, func, cn);
+            set_color(CLR_DEFAULT);
+        }
     }
     fclose(f);
 }
