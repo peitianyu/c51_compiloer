@@ -302,27 +302,102 @@ static const char *extract_program_size(const char *log_file) {
     return NULL;
 }
 
-/* ── 主流程：编译 → 链接 → 转换 HEX ── */
-int embed_run_toolchain(const char *source_file, const char *source_label,
+/* ── 合并多个 Dict 中的条目 ── */
+static void merge_name_maps(Dict *dest, Dict *src) {
+    if (!dest || !src) return;
+    for (int i = 0; i < list_len(src->list); i++) {
+        DictEntry *e = (DictEntry*)list_get(src->list, i);
+        if (!dict_get(dest, e->key))
+            dict_put(dest, strdup(e->key), strdup((const char*)e->val));
+    }
+}
+
+/* ── 检测 C51 源码中是否有 #pragma SRC ── */
+static bool has_pragma_src(const char *c51_source) {
+    FILE *f = fopen(c51_source, "r");
+    if (!f) return false;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        if (strstr(line, "#pragma SRC") || strstr(line, "#pragma\tsRC") ||
+            strstr(line, "#pragma\tSRC") || strstr(line, "#pragma  SRC")) {
+            fclose(f);
+            return true;
+        }
+    }
+    fclose(f);
+    return false;
+}
+
+/* ── 编译单个 C51 文件（自动检测 #pragma SRC 并走 SRC→A51→OBJ 路径）── */
+static int compile_c51_file(const char *keil_bin, const char *source_file,
+                            const char *source_label, const char *base_name,
+                            const char *model_flag, const char *log,
+                            bool is_src_mode) {
+    if (is_src_mode) {
+        /* #pragma SRC 模式：
+         * C51.exe 不生成 .OBJ，只生成 .SRC 到源文件同目录。
+         * 然后 A51.EXE 汇编 .SRC → .OBJ */
+        char src_dir[1024], src_file_only[256];
+        {
+            const char *p = strrchr(source_file, '\\');
+            if (p) {
+                int n = (int)(p - source_file);
+                memcpy(src_dir, source_file, n); src_dir[n] = '\0';
+                strncpy(src_file_only, p + 1, sizeof(src_file_only) - 1);
+                src_file_only[sizeof(src_file_only) - 1] = '\0';
+            } else {
+                snprintf(src_dir, sizeof(src_dir), ".");
+                strncpy(src_file_only, source_file, sizeof(src_file_only) - 1);
+                src_file_only[sizeof(src_file_only) - 1] = '\0';
+            }
+        }
+        /* C51: 只需编译（不指定 OBJECT，因为 SRC 模式不产生 .OBJ） */
+        {
+            char args[8192], cmd[8192];
+            snprintf(args, sizeof(args), "\"%s\" %s",
+                     source_file, model_flag);
+            snprintf(cmd, sizeof(cmd), "cmd.exe /C \"\"%s\\%s\" %s\" >\"%s\" 2>&1",
+                     keil_bin, "C51.exe", args, log);
+            int ret = system(cmd);
+            if (ret && ret != 1) return ret;
+        }
+        /* A51: 汇编 .SRC → .OBJ，SRC 在源文件所在目录 */
+        {
+            char src_path[1024], obj_path[1024], a51_log[1024];
+            snprintf(src_path, sizeof(src_path), "%s\\%s.SRC", src_dir, base_name);
+            snprintf(obj_path, sizeof(obj_path), "%s\\%s.OBJ", get_cwd(), base_name);
+            snprintf(a51_log, sizeof(a51_log), "%s_a51_%s.log", log, base_name);
+            fprintf(stdout, "  A51: %s.SRC\n", base_name);
+            int ret = assemble_a51(keil_bin, src_path, obj_path, a51_log);
+            _unlink(a51_log);
+            return ret;
+        }
+    } else {
+        /* 普通模式：C51 → .OBJ */
+        char obj_with_ext[512];
+        snprintf(obj_with_ext, sizeof(obj_with_ext), "%s.OBJ", base_name);
+        char args[8192];
+        snprintf(args, sizeof(args), "\"%s\" OBJECT(%s) %s",
+                 source_file, obj_with_ext, model_flag);
+        char cmd[8192];
+        snprintf(cmd, sizeof(cmd), "cmd.exe /C \"\"%s\\%s\" %s\" >\"%s\" 2>&1",
+                 keil_bin, "C51.exe", args, log);
+        return system(cmd);
+    }
+}
+
+/* ── 主流程：多文件编译 → 链接 → HEX ── */
+int embed_run_toolchain(List *source_files, List *source_labels,
                         const char *hex_out,
                         const char *temp_dir, int c51_model,
                         List *include_dirs) {
     (void)temp_dir;
-    if (!source_file || !*source_file) return -1;
+    (void)include_dirs;
+    if (list_empty(source_files)) return -1;
 
     const char *keil_bin = detect_keil_bin();
     if (!keil_bin) { fprintf(stdout, "error: Keil C51 not found\n"); return -1; }
-
-    char base_name[256], obj_file[512], abs_file[512];
-    extract_basename(source_file, base_name, sizeof(base_name));
-    snprintf(obj_file, sizeof(obj_file), "%s.OBJ", base_name);
-    snprintf(abs_file, sizeof(abs_file), "%s.ABS", base_name);
-
-    /* 用绝对路径指向 OBJ 文件（BL51 需要）*/
-    char obj_abs[512], abs_abs[512];
     const char *cwd = get_cwd();
-    snprintf(obj_abs, sizeof(obj_abs), "%s\\%s", cwd, obj_file);
-    snprintf(abs_abs, sizeof(abs_abs), "%s\\%s", cwd, abs_file);
 
     const char *model_flag = "SMALL";
     if (c51_model == 1) model_flag = "COMPACT";
@@ -331,49 +406,89 @@ int embed_run_toolchain(const char *source_file, const char *source_label,
     char log[512];
     snprintf(log, sizeof(log), "%s\\ttcc_log.txt", temp_dir);
 
-    /* 解析中文→ASCII 名映射 */
-    Dict *name_map = parse_name_map(source_file);
+    /* 合并所有文件的 name_map */
+    Dict *all_name_maps = make_dict(NULL);
+    /* 收集所有 OBJ 路径 */
+    List *obj_list = make_list();
+    /* 收集需要清理的临时文件 */
+    List *cleanup_files = make_list();
+    int n_total_warnings = 0, n_total_errors = 0;
 
-    /* C51: 编译（OBJECT 必须带 .OBJ 后缀）*/
+    /* ── 阶段1: 逐个编译 C51 文件 ── */
     {
-        char obj_with_ext[512];
-        snprintf(obj_with_ext, sizeof(obj_with_ext), "%s.OBJ", base_name);
-        char args[8192];
-        snprintf(args, sizeof(args), "\"%s\" OBJECT(%s) %s", source_file, obj_with_ext, model_flag);
-        char cmd[8192];
-        snprintf(cmd, sizeof(cmd), "cmd.exe /C \"\"%s\\%s\" %s\" >\"%s\" 2>&1",
-                 keil_bin, "C51.exe", args, log);
-        int ret = system(cmd);
-        if (ret && ret != 1) {
-            fprintf(stdout, "FAILED (exit %d)\n", ret);
-            _unlink(log);
-            return -1;
-        }
-        /* 统计并输出警告/错误摘要 */
-        int nw = 0, ne = 0;
-        {
-            FILE *f = fopen(log, "r");
-            if (f) {
-                char line[1024];
-                while (fgets(line, sizeof(line), f)) {
-                    if (strstr(line, "COMPILATION COMPLETE")) continue;
-                    if (strstr(line, "COPYRIGHT")) continue;
-                    if (strstr(line, "COMPILER")) continue;
-                    if (strstr(line, "WARNING")) nw++;
-                    else if (strstr(line, "ERROR")) ne++;
+        for (int fi = 0; fi < list_len(source_files); fi++) {
+            const char *source_file = (const char*)list_get(source_files, fi);
+            const char *source_label = (fi < list_len(source_labels))
+                ? (const char*)list_get(source_labels, fi) : source_file;
+
+            char base_name[256];
+            extract_basename(source_file, base_name, sizeof(base_name));
+
+            /* 解析该文件的中文→ASCII 名映射并合并 */
+            Dict *file_map = parse_name_map(source_file);
+            merge_name_maps(all_name_maps, file_map);
+            /* free file_map entries but keep strings (already strdup'd into all_name_maps) */
+            {
+                for (int i = 0; i < list_len(file_map->list); i++) {
+                    DictEntry *e = (DictEntry*)list_get(file_map->list, i);
+                    free(e->key); free(e->val); free(e);
                 }
-                fclose(f);
+                free(file_map);
             }
+
+            char obj_path[512];
+            snprintf(obj_path, sizeof(obj_path), "%s\\%s.OBJ", cwd, base_name);
+            list_push(obj_list, strdup(obj_path));
+            list_push(cleanup_files, strdup(obj_path));
+
+            /* 检测是否有 #pragma SRC */
+            bool src_mode = has_pragma_src(source_file);
+            if (src_mode) {
+                /* SRC 模式也会产生 .SRC 临时文件 */
+                char src_path[512];
+                snprintf(src_path, sizeof(src_path), "%s\\%s.SRC", cwd, base_name);
+                list_push(cleanup_files, strdup(src_path));
+            }
+
+            /* C51 编译 */
+            fprintf(stdout, "  C51: %s%s\n", source_label, src_mode ? " (SRC mode)" : "");
+            int ret = compile_c51_file(keil_bin, source_file, source_label,
+                                       base_name, model_flag, log, src_mode);
+            if (ret && ret != 1) {
+                fprintf(stdout, "FAILED (exit %d)\n", ret);
+                return -1;
+            }
+            /* 统计警告/错误 */
+            int nw = 0, ne = 0;
+            {
+                FILE *f = fopen(log, "r");
+                if (f) {
+                    char line[1024];
+                    while (fgets(line, sizeof(line), f)) {
+                        if (strstr(line, "COMPILATION COMPLETE")) continue;
+                        if (strstr(line, "COPYRIGHT")) continue;
+                        if (strstr(line, "COMPILER")) continue;
+                        if (strstr(line, "WARNING")) nw++;
+                        else if (strstr(line, "ERROR")) ne++;
+                    }
+                    fclose(f);
+                }
+            }
+            n_total_warnings += nw;
+            n_total_errors += ne;
+            if (ne || nw)
+                print_c51_warnings(log, source_label, all_name_maps);
         }
-        if (ne || nw) {
-            set_color(ne ? CLR_ERROR : CLR_WARNING);
-            fprintf(stdout, "  %d warning(s), %d error(s)\n", nw, ne);
+        if (n_total_errors || n_total_warnings) {
+            set_color(n_total_errors ? CLR_ERROR : CLR_WARNING);
+            fprintf(stdout, "  Total: %d warning(s), %d error(s)\n",
+                    n_total_warnings, n_total_errors);
             set_color(CLR_DEFAULT);
-            print_c51_warnings(log, source_label ? source_label : source_file, name_map);
         }
         _unlink(log);
     }
-    /* A51: 汇编 STARTUP.A51 和 INIT.A51 */
+
+    /* ── 阶段2: A51 汇编 STARTUP.A51 和 INIT.A51 ── */
     {
         const char *keil_root = detect_keil_root();
         char startup_a51[512], init_a51[512];
@@ -384,12 +499,17 @@ int embed_run_toolchain(const char *source_file, const char *source_label,
         snprintf(init_a51, sizeof(init_a51), "%s\\LIB\\INIT.A51", keil_root);
         snprintf(startup_obj, sizeof(startup_obj), "%s\\STARTUP.OBJ", cwd);
         snprintf(init_obj, sizeof(init_obj), "%s\\INIT.OBJ", cwd);
+        list_push(cleanup_files, strdup(startup_obj));
+        list_push(cleanup_files, strdup(init_obj));
 
+        fprintf(stdout, "  A51: STARTUP.A51\n");
         if (assemble_a51(keil_bin, startup_a51, startup_obj, a51_log)) return -1;
+        fprintf(stdout, "  A51: INIT.A51\n");
         if (assemble_a51(keil_bin, init_a51, init_obj, a51_log)) return -1;
         _unlink(a51_log);
     }
-    /* BL51: 链接（含浮点运算库）*/
+
+    /* ── 阶段3: BL51 链接所有 OBJ + LIB → 直接输出 HEX ── */
     {
         const char *model_lib = "C51S.LIB";
         const char *model_fplib = "C51FPS.LIB";
@@ -400,17 +520,51 @@ int embed_run_toolchain(const char *source_file, const char *source_label,
         snprintf(lib_path, sizeof(lib_path), "%s\\LIB\\%s", keil_root, model_lib);
         snprintf(fplib_path, sizeof(fplib_path), "%s\\LIB\\%s", keil_root, model_fplib);
 
-        char args[8192];
-        snprintf(args, sizeof(args), "\"%s\",\"%s\\STARTUP.OBJ\",\"%s\\INIT.OBJ\",\"%s\",\"%s\" TO \"%s\"",
-                 obj_abs, cwd, cwd, lib_path, fplib_path, abs_abs);
-        /* 优先使用本地嵌入的 BL51 */
+        /* 构建 BL51 输入: obj1.OBJ,...,objN.OBJ,STARTUP.OBJ,INIT.OBJ,LIB,FPLIB TO hex */
+        char args[16384];
+        int pos = 0;
+        for (int i = 0; i < list_len(obj_list); i++) {
+            const char *obj = (const char*)list_get(obj_list, i);
+            if (i > 0) args[pos++] = ',';
+            args[pos++] = '"';
+            int len = (int)strlen(obj);
+            memcpy(args + pos, obj, len); pos += len;
+            args[pos++] = '"';
+        }
+        {
+            char startup_obj[512], init_obj[512];
+            snprintf(startup_obj, sizeof(startup_obj), "%s\\STARTUP.OBJ", cwd);
+            snprintf(init_obj, sizeof(init_obj), "%s\\INIT.OBJ", cwd);
+            snprintf(args + pos, sizeof(args) - pos, ",\"%s\",\"%s\"",
+                     startup_obj, init_obj);
+            pos = (int)strlen(args);
+        }
+
+        /* 计算 HEX 输出路径 */
+        char hex_abs[512];
+        if (hex_out) {
+            strncpy(hex_abs, hex_out, sizeof(hex_abs) - 1);
+            hex_abs[sizeof(hex_abs) - 1] = '\0';
+        } else {
+            const char *first = (const char*)list_get(source_files, 0);
+            char bn[256];
+            extract_basename(first, bn, sizeof(bn));
+            snprintf(hex_abs, sizeof(hex_abs), "%s\\%s.HEX", cwd, bn);
+        }
+
+        /* 追加 LIB, FPLIB, TO */
+        snprintf(args + pos, sizeof(args) - pos, ",\"%s\",\"%s\" TO \"%s\"",
+                 lib_path, fplib_path, hex_abs);
+
+        /* 运行 BL51 */
         char bl51_path[512];
         snprintf(bl51_path, sizeof(bl51_path), "%s\\BL51.EXE", keil_bin);
-        char cmd[8192];
+        char cmd[16384];
         snprintf(cmd, sizeof(cmd), "cmd.exe /C \"\"%s\" %s\" >\"%s\" 2>&1",
                  bl51_path, args, log);
+        fprintf(stdout, "  BL51: linking %d object(s)\n", list_len(obj_list));
         int ret = system(cmd);
-        /* 若失败（可能代码超过 2KB 限制），改用 C:\Keil_v5\C51\BIN\BL51.EXE */
+        /* 若失败尝试 C:\Keil_v5 */
         if (ret && ret != 1 && _access("C:\\Keil_v5\\C51\\BIN\\BL51.EXE", 0) == 0) {
             snprintf(bl51_path, sizeof(bl51_path), "C:\\Keil_v5\\C51\\BIN\\BL51.EXE");
             snprintf(cmd, sizeof(cmd), "cmd.exe /C \"\"%s\" %s\" >\"%s\" 2>&1",
@@ -422,7 +576,7 @@ int embed_run_toolchain(const char *source_file, const char *source_label,
             _unlink(log);
             return -1;
         }
-        print_linker_warnings(log, name_map);
+        print_linker_warnings(log, all_name_maps);
         const char *size = extract_program_size(log);
         if (size) {
             char size_trim[256];
@@ -431,36 +585,39 @@ int embed_run_toolchain(const char *source_file, const char *source_label,
             fprintf(stdout, "  %s\n", size_trim);
         }
         _unlink(log);
+
+        /* 如果 hex_out 不同于默认路径，复制 HEX */
+        if (hex_out) {
+            char default_hex[512];
+            const char *first = (const char*)list_get(source_files, 0);
+            char bn[256];
+            extract_basename(first, bn, sizeof(bn));
+            snprintf(default_hex, sizeof(default_hex), "%s\\%s.HEX", cwd, bn);
+            FILE *fs = fopen(default_hex, "rb");
+            if (fs) {
+                FILE *fd = fopen(hex_out, "wb");
+                if (fd) {
+                    char buf[4096]; size_t n;
+                    while ((n = fread(buf, 1, sizeof(buf), fs)) > 0) fwrite(buf, 1, n, fd);
+                    fclose(fd);
+                }
+                fclose(fs);
+            }
+        }
+        fprintf(stdout, "HEX file: %s\n", hex_out ? hex_out : hex_abs);
     }
-    /* OH51: 转换 HEX */
-    {
-        char args[8192];
-        snprintf(args, sizeof(args), "\"%s\"", abs_abs);
-        if (run_step_silent(keil_bin, "OH51.EXE", args, log)) return -1;
-        _unlink(log);
+
+    /* ── 清理临时文件 ── */
+    for (int i = 0; i < list_len(cleanup_files); i++) {
+        _unlink((const char*)list_get(cleanup_files, i));
     }
-    /* 复制 HEX 到目标路径 */
     {
-        char src_hex[512]; snprintf(src_hex, sizeof(src_hex), "%s\\%s.HEX", cwd, base_name);
-        FILE *fs = fopen(src_hex, "rb");
-        if (!fs) { fprintf(stdout, "warning: HEX not found at %s\n", src_hex); return -1; }
-        const char *dst = hex_out ? hex_out : src_hex;
-        FILE *fd = fopen(dst, "wb");
-        if (!fd) { fprintf(stdout, "error: cannot write %s\n", dst); fclose(fs); return -1; }
-        char buf[4096]; size_t n;
-        while ((n = fread(buf, 1, sizeof(buf), fs)) > 0) fwrite(buf, 1, n, fd);
-        fclose(fd); fclose(fs);
-        set_color(CLR_DEFAULT);
-        fprintf(stdout, "HEX file generated: %s\n", dst);
-    }
-    /* 清理临时文件 */
-    {
-        _unlink(obj_abs);
-        _unlink(abs_abs);
-        char hex_abs[512]; snprintf(hex_abs, sizeof(hex_abs), "%s\\%s.HEX", cwd, base_name); _unlink(hex_abs);
-        char m51_abs[512]; snprintf(m51_abs, sizeof(m51_abs), "%s\\%s.M51", cwd, base_name); _unlink(m51_abs);
-        char startup_obj[512]; snprintf(startup_obj, sizeof(startup_obj), "%s\\STARTUP.OBJ", cwd); _unlink(startup_obj);
-        char init_obj[512]; snprintf(init_obj, sizeof(init_obj), "%s\\INIT.OBJ", cwd); _unlink(init_obj);
+        char m51_abs[512];
+        const char *first = (const char*)list_get(source_files, 0);
+        char bn[256];
+        extract_basename(first, bn, sizeof(bn));
+        snprintf(m51_abs, sizeof(m51_abs), "%s\\%s.M51", cwd, bn);
+        _unlink(m51_abs);
     }
     return 0;
 }

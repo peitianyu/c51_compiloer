@@ -15,5 +15,6 @@
 # 项目目录排除
 .github/
 tests/
+stc15w4k48s4/
 Keil_v5/TOOLS.INI
 Keil_v5/register.ps1

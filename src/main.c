@@ -152,74 +152,104 @@ static void setup_mcs51_defines(int c51_model) {
     if (c51_model == MODEL_LARGE)   pp_global_define("__LARGE__", "1");
 }
 
-/* ─── 编译所有输入文件 → AST 集合 ─── */
-static List *compile_all(List *inputs, List *include_dirs, int target, int c51_model) {
-    List *all_toplevels = make_list();
-    for (Iter it = list_iter(inputs); !iter_end(it); ) {
-        char *path = iter_next(&it);
-        if (target == TGT_MCS51) setup_mcs51_defines(c51_model);
-        for (Iter di = list_iter(include_dirs); !iter_end(di); )
-            pp_global_add_include_path(iter_next(&di));
-        if (!pp_preprocess_to_stdin(path)) die("preprocess failed");
-        set_current_filename(path);
-        parser_reset();
-        List *tops = read_toplevels();
-        if (!tops) die("parse failed");
-        for (int i = 0; i < list_len(tops); i++)
-            list_push(all_toplevels, list_get(tops, i));
-    }
+/* ─── 编译单个输入文件 → AST ─── */
+static List *compile_single_file(const char *path, List *include_dirs, int target, int c51_model) {
+    if (target == TGT_MCS51) setup_mcs51_defines(c51_model);
+    for (Iter di = list_iter(include_dirs); !iter_end(di); )
+        pp_global_add_include_path(iter_next(&di));
+    if (!pp_preprocess_to_stdin(path)) die("preprocess failed");
+    set_current_filename(path);
+    parser_reset();
+    List *tops = read_toplevels();
+    if (!tops) die("parse failed");
     pp_cleanup_temp();
-    return all_toplevels;
+    return tops;
 }
 
-/* ─── 生成 C51 源码到临时文件 ─── */
-static char *generate_c51_source(List *all_toplevels, int c51_model, bool map_names) {
+/* ─── 从单个 AST 生成 C51 源码到临时文件 ─── */
+static char *generate_c51_file(List *toplevels, int c51_model, bool map_names) {
     char c51_dir[4096];
     DWORD ret = GetTempPathA(sizeof(c51_dir), c51_dir);
     if (ret == 0 || ret > sizeof(c51_dir))
         strcpy(c51_dir, "C:\\TEMP\\");
     char *c51_path = malloc(4096);
-    snprintf(c51_path, 4096, "%sttcc_%d.c", c51_dir, _getpid());
+    snprintf(c51_path, 4096, "%sttcc_%d_%d.c", c51_dir, _getpid(), rand());
     FILE *c51_out = fopen(c51_path, "w");
     if (!c51_out) die("cannot create temp file");
-    List *saved_strings = strings;
-    List *saved_ctypes = ctypes;
-    List *lowered = lower_program(all_toplevels, c51_model);
+    List *lowered = lower_program(toplevels, c51_model);
     c51_emit_translation_unit(c51_out, lowered, c51_model, map_names);
     fclose(c51_out);
-    list_free(saved_strings);
-    list_free(saved_ctypes);
     return c51_path;
 }
 
+/* ─── 为所有输入文件生成独立 C51 文件，返回 List<char*> ─── */
+static List *generate_all_c51_files(List *inputs, List *include_dirs, int target, int c51_model, bool map_names) {
+    List *c51_files = make_list();
+    for (Iter it = list_iter(inputs); !iter_end(it); ) {
+        char *path = iter_next(&it);
+        List *tops = compile_single_file(path, include_dirs, target, c51_model);
+        char *c51_path = generate_c51_file(tops, c51_model, map_names);
+        list_push(c51_files, c51_path);
+    }
+    return c51_files;
+}
+
+/* 提取基础文件名 */
+static void extract_basename(const char *path, char *out, int out_sz) {
+    const char *base = strrchr(path, '/');
+    if (!base) base = strrchr(path, '\\');
+    if (!base) base = path; else base++;
+    const char *dot = strrchr(base, '.');
+    int n = dot ? (int)(dot - base) : (int)strlen(base);
+    if (n > out_sz - 1) n = out_sz - 1;
+    strncpy(out, base, n); out[n] = '\0';
+}
+
 /* ─── --no-build 模式：输出 C51 源码 ─── */
-static void output_source_mode(const char *c51_path, const char *outfile) {
-    if (outfile) {
-        rename(c51_path, outfile);
+static void output_source_mode_multi(List *c51_paths, List *inputs, const char *outfile) {
+    if (outfile && list_len(c51_paths) == 1) {
+        rename((const char*)list_get(c51_paths, 0), outfile);
         fprintf(stderr, "note: C51 source -> %s\n", outfile);
-    } else {
-        FILE *f = fopen(c51_path, "r");
-        if (f) { char buf[4096]; size_t n;
-            while ((n = fread(buf, 1, sizeof(buf), f)) > 0) fwrite(buf, 1, n, stdout);
-            fclose(f);
+    } else if (outfile && list_len(c51_paths) > 1) {
+        /* 多文件时输出到目录 */
+        char dir[4096];
+        strncpy(dir, outfile, sizeof(dir) - 1);
+        dir[sizeof(dir) - 1] = '\0';
+        CreateDirectoryA(dir, NULL);
+        for (int i = 0; i < list_len(c51_paths); i++) {
+            const char *src = (const char*)list_get(c51_paths, i);
+            const char *in = (const char*)list_get(inputs, i);
+            char bn[256]; char dst[4096];
+            extract_basename(in, bn, sizeof(bn));
+            snprintf(dst, sizeof(dst), "%s\\%s.c51", dir, bn);
+            rename(src, dst);
+            fprintf(stderr, "note: C51 source -> %s\n", dst);
         }
-        _unlink(c51_path);
+    } else {
+        for (int i = 0; i < list_len(c51_paths); i++) {
+            const char *path = (const char*)list_get(c51_paths, i);
+            FILE *f = fopen(path, "r");
+            if (f) {
+                char buf[4096]; size_t n;
+                while ((n = fread(buf, 1, sizeof(buf), f)) > 0) fwrite(buf, 1, n, stdout);
+                fclose(f);
+            }
+            _unlink(path);
+        }
     }
 }
 
-/* ─── 默认模式：调用 Keil 工具链生成 HEX ─── */
-static void build_hex_mode(const char *c51_path, const char *outfile,
-                           const char *first_input, int c51_model,
-                           List *include_dirs) {
+/* ─── 默认模式：调用 Keil 工具链生成 HEX（多文件同步编译）─── */
+static void build_hex_mode_multi(List *c51_paths, List *inputs,
+                                 const char *outfile,
+                                 const char *first_input, int c51_model,
+                                 List *include_dirs) {
     char hex_path[4096];
     const char *hex_out = outfile;
     if (!hex_out) {
         const char *base = first_input ? first_input : "a";
         char bn[256];
-        const char *dot = strrchr(base, '.');
-        int n = dot ? (int)(dot - base) : (int)strlen(base);
-        if (n > 255) n = 255;
-        strncpy(bn, base, n); bn[n] = '\0';
+        extract_basename(base, bn, sizeof(bn));
         snprintf(hex_path, sizeof(hex_path), "%s.HEX", bn);
         hex_out = hex_path;
     }
@@ -227,8 +257,15 @@ static void build_hex_mode(const char *c51_path, const char *outfile,
     DWORD r2 = GetTempPathA(sizeof(tmp_dir), tmp_dir);
     if (r2 == 0 || r2 > sizeof(tmp_dir))
         strcpy(tmp_dir, "C:\\TEMP\\");
-    int ret = embed_run_toolchain(c51_path, first_input, hex_out, tmp_dir, c51_model, include_dirs);
-    _unlink(c51_path);
+
+    /* 构建 source_labels */
+    List *labels = make_list();
+    for (int i = 0; i < list_len(inputs); i++)
+        list_push(labels, (void*)list_get(inputs, i));
+
+    int ret = embed_run_toolchain(c51_paths, labels, hex_out, tmp_dir, c51_model, include_dirs);
+    for (int i = 0; i < list_len(c51_paths); i++)
+        _unlink((const char*)list_get(c51_paths, i));
     if (ret) { fprintf(stderr, "error: toolchain failed\n"); exit(1); }
 }
 
@@ -242,16 +279,20 @@ int main(int argc, char **argv) {
     if (opts.target == TGT_MCS51)
         parser_set_target_mcs51();
 
-    /* 编译 → C51 源码（--no-build 时保留中文名，HEX 构建时映射为 ASCII）*/
-    List *all_toplevels = compile_all(opts.inputs, opts.include_dirs, opts.target, opts.c51_model);
+    /* 添加 include 路径到预处理器 */
+    for (Iter it = list_iter(opts.include_dirs); !iter_end(it); )
+        pp_global_add_include_path(iter_next(&it));
+
+    /* 每个输入文件独立编译为 C51 文件 */
     bool map_names = !opts.no_build;
-    char *c51_path = generate_c51_source(all_toplevels, opts.c51_model, map_names);
+    List *c51_paths = generate_all_c51_files(opts.inputs, opts.include_dirs, opts.target, opts.c51_model, map_names);
 
     /* 输出 */
     if (opts.no_build) {
-        output_source_mode(c51_path, opts.outfile);
+        output_source_mode_multi(c51_paths, opts.inputs, opts.outfile);
     } else {
-        build_hex_mode(c51_path, opts.outfile, opts.first_input, opts.c51_model, opts.include_dirs);
+        build_hex_mode_multi(c51_paths, opts.inputs, opts.outfile, opts.first_input,
+                             opts.c51_model, opts.include_dirs);
     }
 
     /* 清理 */

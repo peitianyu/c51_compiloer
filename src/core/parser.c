@@ -2958,6 +2958,12 @@ static Ctype *read_decl_spec(void)
             unget_token(tok);
             return clone_ctype_with_attr(ctype, attr);
         }
+        /* 将前面的类型限定词（const/volatile 等）应用到当前类型再包装指针，
+         * 确保 const int *p 被解析为「指向 const int 的指针」而非「const 指针指向 int」 */
+        if (attr) {
+            ctype = clone_ctype_with_attr(ctype, attr);
+            attr = 0;
+        }
         ctype = make_ptr_type(ctype);
     }
 }
