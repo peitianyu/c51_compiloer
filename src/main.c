@@ -356,6 +356,18 @@ int main(int argc, char **argv) {
     for (Iter it = list_iter(opts.include_dirs); !iter_end(it); )
         pp_global_add_include_path(iter_next(&it));
 
+    /* 自动添加 Keil C51 INC 路径：检测 exe 同目录下的 Keil_v5\C51\INC */
+    {
+        char inc_path[4096];
+        GetModuleFileNameA(NULL, inc_path, sizeof(inc_path));
+        char *p = strrchr(inc_path, '\\');
+        if (p) {
+            *(p + 1) = '\0';  /* 保留尾部反斜杠 */
+            strcat(inc_path, "Keil_v5\\C51\\INC");
+            pp_global_add_include_path(inc_path);
+        }
+    }
+
     /* 输出 */
     if (opts.no_build) {
         /* --no-build 模式：用旧方式生成到临时目录 */
