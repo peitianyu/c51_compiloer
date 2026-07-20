@@ -265,6 +265,40 @@ static long long lower_eval_const_expr(Ast *ast) {
     }
 }
 
+/* 常量条件折叠：遍历 stmts，对 if(常量表达式) 编译期求值并折叠 */
+static void lower_fold_if_const_in_stmts(List *stmts) {
+    if (!stmts) return;
+    for (int i = 0; i < list_len(stmts); i++) {
+        Ast *s = (Ast*)list_get(stmts, i);
+        if (!s) continue;
+        if (s->type == AST_IF && s->cond && is_inttype(s->cond->ctype)) {
+            long long val = lower_eval_const_expr(s->cond);
+            if (val != 0 && s->then) {
+                list_set(stmts, i, s->then);
+            } else if (val == 0 && s->els) {
+                list_set(stmts, i, s->els);
+            }
+        }
+        /* 递归：只在 AST_COMPOUND_STMT 节点访问 stmts 字段（union 安全） */
+        Ast *next = (Ast*)list_get(stmts, i);
+        if (!next) continue;
+        if (next->type == AST_COMPOUND_STMT && next->stmts) {
+            lower_fold_if_const_in_stmts(next->stmts);
+        } else if (next->type == AST_FOR) {
+            if (next->forbody && next->forbody->type == AST_COMPOUND_STMT && next->forbody->stmts)
+                lower_fold_if_const_in_stmts(next->forbody->stmts);
+        } else if (next->type == AST_WHILE || next->type == AST_DO_WHILE) {
+            if (next->while_body && next->while_body->type == AST_COMPOUND_STMT && next->while_body->stmts)
+                lower_fold_if_const_in_stmts(next->while_body->stmts);
+        } else if (next->type == AST_IF) {
+            if (next->then && next->then->type == AST_COMPOUND_STMT && next->then->stmts)
+                lower_fold_if_const_in_stmts(next->then->stmts);
+            if (next->els && next->els->type == AST_COMPOUND_STMT && next->els->stmts)
+                lower_fold_if_const_in_stmts(next->els->stmts);
+        }
+    }
+}
+
 /* 在 stmts 列表中查找并处理 _Static_assert：移除通过检查的节点，失败则终止 */
 static void lower_process_static_assert_in_stmts(List *stmts, const char *context) {
     if (!stmts) return;
@@ -402,6 +436,11 @@ List *lower_program(List *toplevels, int c51_model) {
             if (node->body) lower_hoist_decls(node->body);
             if (node->body) lower_split_for_init(node->body);
             lower_expand_compound_literal(node);
+            if (node->body) {
+                lower_fold_if_const_in_stmts(node->body->stmts);
+                /* 再折叠一遍处理 do{}while(0) 内部 */
+                lower_fold_if_const_in_stmts(node->body->stmts);
+            }
         }
         if (node->type == AST_DECL) lower_expand_compound_literal(node);
     }

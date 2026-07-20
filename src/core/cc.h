@@ -308,6 +308,8 @@ extern Token peek_token(void);
 extern Token read_token(void);
 extern TokenInfo get_current_token_info(void) __attribute__((__unused__));
 extern void set_current_filename(const char *filename);
+extern void lexer_set_input(FILE *fp);
+extern void lexer_reset(void);
 
 #define get_priv(tok, type)                                       \
     ({                                                            \

@@ -20,24 +20,8 @@
  */
 void c51_emit_translation_unit(FILE *out, List *toplevels, int c51_model, bool map_names);
 
-/* ── 仅输出来自指定源文件的顶层声明（用于 .c51 / .h51 分流输出）──
- * source_filter: 只输出来自该文件的声明，NULL 则输出全部。
- * out_includes:  非 NULL 时，将遇到的 .h 引用路径写入此 Dict（key=路径, val=略）。
- */
-void c51_emit_filtered(FILE *out, List *toplevels,
-                       const char *source_filter,
-                       Dict *out_includes,
-                       int c51_model, bool map_names);
-
-/* ── 从 toplevels 收集所有被引用的 .h 文件路径（去重）──
- * 返回 Dict* (key=文件路径, val=(void*)1) */
-Dict *c51_collect_headers(List *toplevels);
-
 /* ── 中文→ASCII 名映射 ── */
 /* 返回 Dict* (key=ASCII别名, val=中文原名) */
 Dict *c51_get_name_map(void);
-
-/* ── 内存模型配置 ── */
-void c51_set_mem_model(int model);  /* 0=small, 1=compact, 2=large */
 
 #endif /* CODEGEN_C51_H */

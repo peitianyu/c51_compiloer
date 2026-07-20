@@ -5,6 +5,7 @@
 #include <time.h>
 #include <windows.h>
 #include <io.h>    /* _dup2, _fileno */
+#include <process.h>
 
 #define PP_PATH_SEP '/'
 #define PP_PATH_SEP_STR "/"
@@ -12,9 +13,19 @@
 #include "cc.h"
 
 /* 跨平台临时文件辅助 */
+static char g_pp_tmp_name[MAX_PATH] = "";
 static FILE *pp_tmpfile(void)
 {
-    return tmpfile();
+    if (g_pp_tmp_name[0]) {
+        _unlink(g_pp_tmp_name);
+        g_pp_tmp_name[0] = '\0';
+    }
+    char tmp_dir[MAX_PATH];
+    DWORD r = GetTempPathA(sizeof(tmp_dir), tmp_dir);
+    if (r == 0 || r > sizeof(tmp_dir)) strcpy(tmp_dir, "C:\\TEMP\\");
+    int rv = rand();
+    snprintf(g_pp_tmp_name, sizeof(g_pp_tmp_name), "%sttcc_pp_%d_%d.tmp", tmp_dir, rv, _getpid());
+    return fopen(g_pp_tmp_name, "w+b");
 }
 
 #define PP_LINE_SIZE 4096
@@ -2191,26 +2202,34 @@ bool pp_preprocess_to_stdin(const char *filename)
     }
     
     char *line;
-    char *last_file = NULL;
-    int last_line = 0;
+    char *prevt_file = NULL;
+    int prevt_line = 0;
+    int lineno = 0;
     while ((line = pp_global_read_line()) != NULL) {
+        lineno++;
+        if (line[0] == '\0') continue;
         const char *cur_file = pp_global_current_file();
         int cur_line = pp_global_current_line();
         if (cur_file) {
-            if (!last_file || strcmp(cur_file, last_file) != 0 || cur_line != last_line + 1) {
+            if (!prevt_file || strcmp(cur_file, prevt_file) != 0) {
+                /* 文件切换：总是从 #line 1 开始（跳过前面的 #ifndef 等空行） */
+                fprintf(tmp, "#line 1 \"%s\"\n", cur_file);
+            } else if (cur_line != prevt_line + 1) {
                 fprintf(tmp, "#line %d \"%s\"\n", cur_line, cur_file);
             }
-            if (last_file) free(last_file);
-            last_file = strdup(cur_file);
-            last_line = cur_line;
+            if (prevt_file) free(prevt_file);
+            prevt_file = strdup(cur_file);
+            prevt_line = cur_line;
+            fprintf(tmp, "%s\n", line);
         }
-        fprintf(tmp, "%s\n", line);
     }
-    if (last_file) free(last_file);
+    if (prevt_file) free(prevt_file);
     
     fflush(tmp);
     rewind(tmp);
-    return _dup2(_fileno(tmp), _fileno(stdin)) == 0;
+    /* 让 lexer 直接从临时文件读取 */
+    lexer_set_input(tmp);
+    return true;
 }
 
 /* 清理预处理临时文件（预留接口） */

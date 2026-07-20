@@ -9,7 +9,7 @@
 
 /* ── 从 C51 源码中解析中文→ASCII 名映射 ── */
 /* 映射格式（在 C51 文件末尾的注释中）：
- *   /* __TTCC_NAME_MAP__ _cn_1=阶乘 _cn_2=初始化硬件 *​/
+ *   " __TTCC_NAME_MAP__ _cn_1=阶乘 _cn_2=初始化硬件 "
  * 返回已分配的 Dict* (key=ASCII别名, val=中文原名) */
 static Dict *parse_name_map(const char *c51_source) {
     Dict *map = make_dict(NULL);
@@ -200,10 +200,16 @@ static void print_c51_warnings(const char *log_file, const char *source_label, D
             snprintf(cn, sizeof(cn), "函数未被调用，已丢弃");
         else if (strstr(desc, "constant out of range"))
             snprintf(cn, sizeof(cn), "常量超出范围");
-        else if (strstr(desc, "unreachable code"))
-            snprintf(cn, sizeof(cn), "不可达代码");
-        else
-            snprintf(cn, sizeof(cn), "%s", desc);
+        else if (strstr(desc, "unreachable code")) {
+            snprintf(cn, sizeof(cn), "不可达代码（常量条件分支）");
+        }
+        else {
+            /* 无法识别的 warning：打印原始 C51 行以便排查 */
+            char dbg[1024]; strncpy(dbg, line, 1023); dbg[1023]=0;
+            int dlen = strlen(dbg); while(dlen>0&&(dbg[dlen-1]=='\n'||dbg[dlen-1]=='\r')) dbg[--dlen]=0;
+            fprintf(stdout, "  C51 WARNING: %s\n", dbg);
+            continue;
+        }
 
         set_color(is_err ? CLR_ERROR : CLR_WARNING);
         if (func[0]) {
@@ -335,6 +341,7 @@ static int compile_c51_file(const char *keil_bin, const char *keil_root,
                             const char *model_flag, const char *log,
                             bool is_src_mode,
                             List *include_dirs) {
+    (void)keil_root; (void)source_label; (void)include_dirs;
     if (is_src_mode) {
         /* #pragma SRC 模式：
          * C51.exe 不生成 .OBJ，只生成 .SRC 到源文件同目录。 */
@@ -676,3 +683,6 @@ int embed_run_toolchain(List *source_files, List *source_labels,
     }
     return 0;
 }
+
+int g_embed_debug_flag = 0;
+

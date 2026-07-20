@@ -184,6 +184,7 @@ static List *compile_single_file(const char *path, List *include_dirs, int targe
     pp_global_on_init(pp_setup_hook);
     if (!pp_preprocess_to_stdin(path)) die("preprocess failed");
     set_current_filename(path);
+    lexer_reset();
     parser_reset();
     List *tops = read_toplevels();
     if (!tops) die("parse failed");
@@ -197,8 +198,8 @@ static char *generate_c51_file_old(List *toplevels, int c51_model, bool map_name
     DWORD ret = GetTempPathA(sizeof(c51_dir), c51_dir);
     if (ret == 0 || ret > sizeof(c51_dir))
         strcpy(c51_dir, "C:\\TEMP\\");
-    char *c51_path = malloc(4096);
-    snprintf(c51_path, 4096, "%sttcc_%d_%d.c", c51_dir, _getpid(), rand());
+    char *c51_path = malloc(8192);
+    snprintf(c51_path, 8192, "%sttcc_%d_%d.c", c51_dir, _getpid(), rand());
     FILE *c51_out = fopen(c51_path, "w");
     if (!c51_out) die("cannot create temp file");
     List *lowered = lower_program(toplevels, c51_model);
@@ -232,7 +233,7 @@ static void output_source_mode_multi(List *c51_paths, List *inputs, const char *
         for (int i = 0; i < list_len(c51_paths); i++) {
             const char *src = (const char*)list_get(c51_paths, i);
             const char *in = (const char*)list_get(inputs, i);
-            char bn[256]; char dst[4096];
+            char bn[256]; char dst[8192];
             extract_basename(in, bn, sizeof(bn));
             snprintf(dst, sizeof(dst), "%s\\%s.c51", dir, bn);
             rename(src, dst);
@@ -256,12 +257,7 @@ static void output_source_mode_multi(List *c51_paths, List *inputs, const char *
 static void append_51_ext(const char *src_path, char *out, int out_sz) {
     char base[256];
     extract_basename(src_path, base, sizeof(base));
-    /* 保留原始扩展名后缀用于判断 h/c */
-    const char *dot = strrchr(src_path, '.');
-    if (dot && (dot[1] == 'h' || dot[1] == 'H'))
-        snprintf(out, out_sz, "%s.h51", base);
-    else
-        snprintf(out, out_sz, "%s.51", base);
+    snprintf(out, out_sz, "%s.51", base);
 }
 
 /* ─── 获取目录名 ─── */
@@ -284,7 +280,7 @@ static void build_with_includes(List *inputs, List *include_dirs,
     const char *first = first_input ? first_input : (const char*)list_get(inputs, 0);
 
     /* 确定 build 目录 */
-    char build_root[4096] = "build";
+    char build_root[8192] = "build";
     CreateDirectoryA("build", NULL);
     {
         /* 在 build 下镜像第一层目录：stc15w4k48s4/ → build/stc15w4k48s4/ */
@@ -303,27 +299,31 @@ static void build_with_includes(List *inputs, List *include_dirs,
         }
     }
     bool map_names = true;
-    List *c51_paths = make_list();
-    List *c51_labels = make_list();
+    /* ── 阶段1: 编译所有输入文件，合并 AST ── */
+    List *all_tops = make_list();
     for (int i = 0; i < list_len(inputs); i++) {
         const char *in_path = (const char*)list_get(inputs, i);
         List *tops = compile_single_file(in_path, include_dirs, target, c51_model);
-        List *lowered = lower_program(tops, c51_model);
-        char out_name[4096];
-        append_51_ext(in_path, out_name, sizeof(out_name));
-        char full_path[4096];
-        snprintf(full_path, sizeof(full_path), "%s\\%s", build_root, out_name);
-        char dir[4096];
-        get_dirname(full_path, dir, sizeof(dir));
-        CreateDirectoryA(dir, NULL);
-        FILE *f = fopen(full_path, "w");
-        if (!f) { fprintf(stderr, "error: cannot write %s\n", full_path); exit(1); }
-        c51_emit_translation_unit(f, lowered, c51_model, map_names);
-        fclose(f);
-        list_push(c51_paths, strdup(full_path));
-        list_push(c51_labels, strdup(in_path));
-        fprintf(stdout, "  C51: %s\n", full_path);
+        for (int j = 0; j < list_len(tops); j++)
+            list_push(all_tops, list_get(tops, j));
     }
+    /* ── 阶段2: 一次降级 + 一次代码生成 ── */
+    List *lowered = lower_program(all_tops, c51_model);
+    /* 输出文件名取第一个输入 */
+    char out_name[4096];
+    append_51_ext(first, out_name, sizeof(out_name));
+    char full_path[12288];
+    snprintf(full_path, sizeof(full_path), "%s\\%s", build_root, out_name);
+    char dir[4096];
+    get_dirname(full_path, dir, sizeof(dir));
+    CreateDirectoryA(dir, NULL);
+    FILE *f = fopen(full_path, "w");
+    if (!f) { fprintf(stderr, "error: cannot write %s\n", full_path); exit(1); }
+    c51_emit_translation_unit(f, lowered, c51_model, map_names);
+    fclose(f);
+    fprintf(stdout, "  C51: %s\n", full_path);
+    List *c51_paths = make_list();
+    list_push(c51_paths, strdup(full_path));
     char hex_path[4096];
     const char *hex_out = outfile;
     if (!hex_out) {
@@ -336,17 +336,10 @@ static void build_with_includes(List *inputs, List *include_dirs,
     DWORD r2 = GetTempPathA(sizeof(tmp_dir), tmp_dir);
     if (r2 == 0 || r2 > sizeof(tmp_dir))
         strcpy(tmp_dir, "C:\\TEMP\\");
+    List *c51_labels = make_list();
+    list_push(c51_labels, strdup(first));
     int ret = embed_run_toolchain(c51_paths, c51_labels, hex_out, tmp_dir, c51_model, include_dirs);
     if (ret) { fprintf(stderr, "error: toolchain failed\n"); exit(1); }
-}
-
-static void build_hex_mode_multi(List *c51_paths, List *inputs,
-                                 const char *outfile,
-                                 const char *first_input, int c51_model,
-                                 List *include_dirs, int target) {
-    (void)c51_paths;
-    /* 新版流水线：直接从 inputs 出发 */
-    build_with_includes(inputs, include_dirs, outfile, first_input, target, c51_model);
 }
 
 /* ─── 入口 ─── */
@@ -370,8 +363,8 @@ int main(int argc, char **argv) {
         List *c51_paths = generate_all_c51_files(opts.inputs, opts.include_dirs, opts.target, opts.c51_model, map_names);
         output_source_mode_multi(c51_paths, opts.inputs, opts.outfile);
     } else {
-        build_hex_mode_multi(NULL, opts.inputs, opts.outfile, opts.first_input,
-                             opts.c51_model, opts.include_dirs, opts.target);
+        build_with_includes(opts.inputs, opts.include_dirs, opts.outfile, opts.first_input,
+                             opts.target, opts.c51_model);
     }
 
     /* 清理 */
@@ -380,3 +373,5 @@ int main(int argc, char **argv) {
     free(opts.inputs);
     return 0;
 }
+
+// DEBUG: entry point

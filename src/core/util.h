@@ -98,6 +98,7 @@ static inline void errorf(char *file, int line, char *fmt, ...)
     #if TTCC_DEBUG
     fprintf(stderr, "%s:%d: ", file, line);
     #else 
+    (void)file; (void)line;
     TokenInfo info = get_current_token_info();
     fprintf(stderr, "%s:%d: ", info.file, info.line);
     #endif 

@@ -16,6 +16,9 @@
 static int ungotten_count = 0;
 static Token ungotten_buf[16] = {{0}};
 
+/* 可切换的输入流：默认 stdin，PP 可设为临时文件指针 */
+static FILE *g_lex_input = NULL;
+
 static int getc_with_pos(void);
 static int ungetc_with_pos(int c);
 
@@ -101,7 +104,7 @@ static void update_pos(int c) {
 }
 
 static int getc_with_pos(void) {
-    int c = getc(stdin);
+    int c = getc(g_lex_input ? g_lex_input : stdin);
     if (c != EOF) {
         update_pos(c);
     }
@@ -115,7 +118,7 @@ static int ungetc_with_pos(int c) {
     } else if (c != EOF) {
         curr_col--;
     }
-    return ungetc(c, stdin);
+    return ungetc(c, g_lex_input ? g_lex_input : stdin);
 }
 
 static const char *skip_space_str(const char *p)
@@ -657,4 +660,12 @@ void set_current_filename(const char *filename) {
     curr_line = 1;
     curr_col = 1;
     last_line_length = 0;
+}
+
+void lexer_set_input(FILE *fp) {
+    g_lex_input = fp;
+}
+
+void lexer_reset(void) {
+    ungotten_count = 0;
 }
