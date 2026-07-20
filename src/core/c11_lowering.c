@@ -99,16 +99,43 @@ C51MemSpace c51_default_memspace(Ctype *ctype, bool is_local, int mem_model) {
 
 void lower_hoist_decls(Ast *ast) {
     if (!ast || ast->type != AST_COMPOUND_STMT || !ast->stmts) return;
+    /* 先递归处理嵌套块，并将嵌套块中的 AST_DECL 抽取到父块 */
+    List *extracted_decls = NULL;
     for (int i = 0; i < list_len(ast->stmts); i++) {
         Ast *child = list_get(ast->stmts, i);
-        if (child && child->type == AST_COMPOUND_STMT) lower_hoist_decls(child);
+        if (child && child->type == AST_COMPOUND_STMT) {
+            lower_hoist_decls(child);
+            /* 检查子块是否只含 decl——若是则抽取到父块 */
+            if (child->stmts && list_len(child->stmts) > 0) {
+                bool all_decls = true;
+                for (int j = 0; j < list_len(child->stmts); j++) {
+                    Ast *cs = list_get(child->stmts, j);
+                    if (cs->type != AST_DECL) { all_decls = false; break; }
+                }
+                if (all_decls) {
+                    if (!extracted_decls) extracted_decls = make_list();
+                    for (int j = 0; j < list_len(child->stmts); j++)
+                        list_push(extracted_decls, list_get(child->stmts, j));
+                    /* 子块被掏空，标记移除 */
+                    list_set(ast->stmts, i, NULL);
+                }
+            }
+        }
     }
+    /* 分离 decl 和非 decl */
     List *decls = make_list();
     List *non_decls = make_list();
     for (int i = 0; i < list_len(ast->stmts); i++) {
         Ast *s = list_get(ast->stmts, i);
+        if (!s) continue;
         if (s->type == AST_DECL) list_push(decls, s);
         else list_push(non_decls, s);
+    }
+    /* 提取的 decl 加入 */
+    if (extracted_decls) {
+        for (int i = 0; i < list_len(extracted_decls); i++)
+            list_push(decls, list_get(extracted_decls, i));
+        free(extracted_decls);
     }
     if (list_len(decls) == 0) { free(decls); free(non_decls); return; }
     ast->stmts = make_list();
@@ -218,9 +245,54 @@ void lower_expand_compound_literal(Ast *ast) {
 Ast *lower_flatten_designated_init(Ast *ast) { (void)ast; return ast; }
 void lower_expand_generic(Ast *ast) { (void)ast; }
 
-/* 编译期常量整数表达式求值（在 lower pass 中自包含，不依赖 parser.c 的 eval_intexpr） */
+/* 编译期常量整数表达式求值（在 lower pass 中自包含，不依赖 parser.c 的 eval_intexpr）
+ * 对非编译期可求值的节点返回 LLONG_MIN 表示"无法求值" */
+#define LOWER_NOT_CONST LLONG_MIN
+
+static bool lower_is_const_expr(Ast *ast) {
+    if (!ast) return true; /* NULL 可视为常量 0 */
+    switch (ast->type) {
+    case AST_LITERAL:
+        return ast->ctype && (ast->ctype->type >= CTYPE_BOOL && ast->ctype->type <= CTYPE_LONG);
+    case '+': case '-': case '*': case '/': case '%':
+    case '&': case '|': case '^':
+    case '>': case '<': case PUNCT_EQ: case PUNCT_NE:
+    case PUNCT_LE: case PUNCT_GE:
+    case PUNCT_LSHIFT: case PUNCT_RSHIFT:
+    case PUNCT_LOGAND: case PUNCT_LOGOR:
+        return lower_is_const_expr(ast->left) && lower_is_const_expr(ast->right);
+    case '!': case '~': case PUNCT_INC: case PUNCT_DEC:
+        return lower_is_const_expr(ast->operand);
+    case AST_CAST:
+        if (ast->cast_expr) return lower_is_const_expr(ast->cast_expr);
+        if (ast->operand) return lower_is_const_expr(ast->operand);
+        return false;
+    case AST_TERNARY:
+        return lower_is_const_expr(ast->cond) && lower_is_const_expr(ast->then) && lower_is_const_expr(ast->els);
+    case AST_GVAR:
+        /* 全局变量有常量初始化器才可视为常量 */
+        if (ast->ginit) { 
+            /* 简单类型可直接求值；struct/array 初始化器非整数常量 */
+            if (ast->ctype && (ast->ctype->type >= CTYPE_BOOL && ast->ctype->type <= CTYPE_LONG))
+                return lower_is_const_expr(ast->ginit);
+        }
+        /* 无初始化器的全局变量和 static 局部（__sloc_）不可折叠 */
+        return false;
+    case AST_STRING:
+    case AST_LVAR:
+    case AST_FUNCALL:
+    case AST_DEREF:
+    case AST_ADDR:
+    case AST_STRUCT_REF:
+    case AST_BIT_REF:
+    default:
+        return false;
+    }
+}
+
 static long long lower_eval_const_expr(Ast *ast) {
     if (!ast) return 0;
+    if (!lower_is_const_expr(ast)) return LOWER_NOT_CONST;
     switch (ast->type) {
     case AST_LITERAL:
         if (ast->ctype && (ast->ctype->type >= CTYPE_BOOL && ast->ctype->type <= CTYPE_LONG))
@@ -273,10 +345,13 @@ static void lower_fold_if_const_in_stmts(List *stmts) {
         if (!s) continue;
         if (s->type == AST_IF && s->cond && is_inttype(s->cond->ctype)) {
             long long val = lower_eval_const_expr(s->cond);
-            if (val != 0 && s->then) {
-                list_set(stmts, i, s->then);
-            } else if (val == 0 && s->els) {
-                list_set(stmts, i, s->els);
+            /* LOWER_NOT_CONST 表示无法在编译期求值，跳过折叠 */
+            if (val != LOWER_NOT_CONST) {
+                if (val != 0 && s->then) {
+                    list_set(stmts, i, s->then);
+                } else if (val == 0 && s->els) {
+                    list_set(stmts, i, s->els);
+                }
             }
         }
         /* 递归：只在 AST_COMPOUND_STMT 节点访问 stmts 字段（union 安全） */
