@@ -28,7 +28,16 @@ static bool g_map_names_enabled = true;
 /* 若 map_names=true 且名字含非 ASCII 字符，返回 ASCII 别名；
  * 否则原样返回。 */
 static const char *c51_map_name(const char *name) {
-    if (!name || !g_map_names_enabled) return name;
+    if (!name) return name;
+    /* C11 → Keil C51 数学函数名映射 */
+    if (!strcmp(name, "atan2f")) return "atan2";
+    if (!strcmp(name, "asinf"))  return "asin";
+    if (!strcmp(name, "acosf"))  return "acos";
+    if (!strcmp(name, "sinf"))   return "sin";
+    if (!strcmp(name, "cosf"))   return "cos";
+    if (!strcmp(name, "sqrtf"))  return "sqrt";
+    if (!strcmp(name, "tanf"))   return "tan";
+    if (!g_map_names_enabled) return name;
     bool has_non_ascii = false;
     for (const unsigned char *p = (const unsigned char*)name; *p; p++) {
         if (*p >= 0x80) { has_non_ascii = true; break; }
