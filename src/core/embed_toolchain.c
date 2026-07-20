@@ -204,10 +204,39 @@ static void print_c51_warnings(const char *log_file, const char *source_label, D
             snprintf(cn, sizeof(cn), "不可达代码（常量条件分支）");
         }
         else {
-            /* 无法识别的 warning：打印原始 C51 行以便排查 */
-            char dbg[1024]; strncpy(dbg, line, 1023); dbg[1023]=0;
-            int dlen = strlen(dbg); while(dlen>0&&(dbg[dlen-1]=='\n'||dbg[dlen-1]=='\r')) dbg[--dlen]=0;
-            fprintf(stdout, "  C51 WARNING: %s\n", dbg);
+            /* 提取原始行中的文件名和行号: "IN LINE 346 OF build\file.51: desc" */
+            char file_buf[256] = "", line_str[32] = "";
+            char *in_line = strstr(line, "IN LINE ");
+            if (in_line) {
+                in_line += 8; /* 跳过 "IN LINE " */
+                char *p = in_line;
+                while (*p && isdigit((unsigned char)*p) && (p - in_line) < 31)
+                    p++;
+                if (p > in_line) {
+                    int ln = (int)(p - in_line);
+                    strncpy(line_str, in_line, ln);
+                    line_str[ln] = '\0';
+                }
+                char *of = strstr(p, " OF ");
+                if (of) {
+                    of += 4;
+                    char *colon = strchr(of, ':');
+                    if (colon) {
+                        int fn = (int)(colon - of);
+                        if (fn > 255) fn = 255;
+                        strncpy(file_buf, of, fn);
+                        file_buf[fn] = '\0';
+                    }
+                }
+            }
+            if (file_buf[0] && line_str[0]) {
+                fprintf(stdout, "  C51 WARNING: %s:%s: %s\n", file_buf, line_str, desc);
+            } else {
+                /* fallback: 打印原始行 */
+                char dbg[1024]; strncpy(dbg, line, 1023); dbg[1023]=0;
+                int dlen = strlen(dbg); while(dlen>0&&(dbg[dlen-1]=='\n'||dbg[dlen-1]=='\r')) dbg[--dlen]=0;
+                fprintf(stdout, "  C51 WARNING: %s\n", dbg);
+            }
             continue;
         }
 
