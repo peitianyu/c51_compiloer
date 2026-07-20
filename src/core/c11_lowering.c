@@ -13,7 +13,8 @@ static void lower_walk_ast_internal(Ast *ast, void (*visitor)(Ast *), int depth)
     switch (ast->type) {
     case AST_LITERAL: case AST_STRING: case AST_LVAR: case AST_GVAR:
     case AST_FUNC_DECL: case AST_FUNC_DEF: case AST_ASM: case AST_STATIC_ASSERT:
-    case AST_TYPE_DEF: case AST_ENUM_DEF: case AST_STRUCT_DEF: break;
+    case AST_ENUM_DEF: case AST_STRUCT_DEF:
+    case AST_TYPE_DEF: break;
     case AST_FUNCALL:
         lower_walk_ast_internal(ast->fnexpr, visitor, depth);
         if (ast->args) for (int i = 0; i < list_len(ast->args); i++)
@@ -331,11 +332,27 @@ void lower_strip_c11_attrs(Ast *ast) { lower_walk_ast(ast, strip_c11_attrs_visit
 static int anon_seq = 0;
 static void handle_anonymous_visitor(Ast *ast) {
     if (!ast) return;
-    if (ast->type == AST_STRUCT_DEF || ast->type == AST_DECL) {
-        Ctype *ct = NULL;
-        if (ast->type == AST_STRUCT_DEF) ct = ast->ctype;
-        else if (ast->declvar && ast->declvar->ctype) ct = ast->declvar->ctype;
-        if (ct && ct->type == CTYPE_STRUCT && ct->fields) {
+    Ctype *ct = NULL;
+    char *typedef_name = NULL;
+    if (ast->type == AST_STRUCT_DEF) {
+        ct = ast->ctype;
+    } else if (ast->type == AST_DECL) {
+        if (ast->declvar && ast->declvar->ctype) ct = ast->declvar->ctype;
+    } else if (ast->type == AST_TYPE_DEF) {
+        if (ast->ctype) ct = ast->ctype;
+        typedef_name = ast->typename;
+    }
+    if (ct && ct->type == CTYPE_STRUCT && !ct->tag) {
+        if (typedef_name) {
+            /* typedef struct { ... } Name; → 把 Name 赋给 struct 作为 tag */
+            ct->tag = strdup(typedef_name);
+        } else {
+            char anon_name[64];
+            snprintf(anon_name, sizeof(anon_name), "__anon_%d", anon_seq++);
+            ct->tag = strdup(anon_name);
+        }
+    }
+    if (ct && ct->type == CTYPE_STRUCT && ct->fields) {
             List *keys = dict_keys(ct->fields);
             List *vals = dict_values(ct->fields);
             for (int i = 0; i < list_len(keys); i++) {
@@ -355,7 +372,6 @@ static void handle_anonymous_visitor(Ast *ast) {
             }
             free(keys); free(vals);
         }
-    }
 }
 void lower_handle_anonymous(Ast *ast) { lower_walk_ast(ast, handle_anonymous_visitor); }
 

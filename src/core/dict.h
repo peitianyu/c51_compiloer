@@ -114,6 +114,13 @@ static inline void dict_clear(Dict *dict)
     free(dict);
 }
 
+/* 清空 dict 内容（entries），保留 dict 结构本身以便重用 */
+static inline void dict_reset(Dict *dict)
+{
+    if (!dict) return;
+    list_clear(dict->list);
+}
+
 static inline void dict_free(Dict *dict, void (*free_val)(void*))
 {
     if (!dict) return;

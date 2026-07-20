@@ -2143,16 +2143,50 @@ int pp_global_current_line(void)
     return pp_current_line(g_pp);
 }
 
-/* 高级接口：预处理文件并重定向到stdin */
+/* 保存重设回调的静态链表（跨文件编译时保留） */
+static List *g_pp_post_init_hooks = NULL;
+
+void pp_global_on_init(void (*hook)(void)) {
+    if (!g_pp_post_init_hooks) g_pp_post_init_hooks = make_list();
+    list_push(g_pp_post_init_hooks, (void*)hook);
+}
+
 bool pp_preprocess_to_stdin(const char *filename)
 {
     FILE *tmp = pp_tmpfile();
     if (!tmp) return false;
     
+    /* 重用 PP 上下文，重置文件栈和条件栈，避免头文件守卫跨文件泄漏 */
     if (!g_pp) pp_global_init();
+    while (g_pp->input) {
+        InputFile *old = g_pp->input;
+        g_pp->input = old->next;
+        if (old->fp) fclose(old->fp);
+        free(old->filename);
+        free(old->buf);
+        free(old);
+    }
+    while (g_pp->cond_stack) {
+        CondState *cs = g_pp->cond_stack;
+        g_pp->cond_stack = cs->next;
+        free(cs);
+    }
+    g_pp->in_block_comment = false;
+    if (g_pp->pragma_once) dict_reset(g_pp->pragma_once);
+    /* 清空宏定义，防止头文件守卫跨文件泄漏 */
+    if (g_pp->macros) dict_reset(g_pp->macros);
+    /* 执行注册的初始化钩子 */
+    if (g_pp_post_init_hooks) {
+        for (int i = 0; i < list_len(g_pp_post_init_hooks); i++) {
+            void (*hook)(void) = (void (*)(void))list_get(g_pp_post_init_hooks, i);
+            hook();
+        }
+    }
+    /* 重置 lexer 文件名 */
+    set_current_filename("<stdin>");
+    
     if (!pp_global_push_file(filename)) {
         fclose(tmp);
-        pp_global_free();
         return false;
     }
     
@@ -2176,10 +2210,6 @@ bool pp_preprocess_to_stdin(const char *filename)
     
     fflush(tmp);
     rewind(tmp);
-
-    /* 释放当前文件的预处理上下文，避免宏/头文件守卫泄漏到下一个文件 */
-    pp_global_free();
-
     return _dup2(_fileno(tmp), _fileno(stdin)) == 0;
 }
 

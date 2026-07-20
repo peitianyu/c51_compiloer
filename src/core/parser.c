@@ -4308,14 +4308,31 @@ List *read_toplevels(void)
         Ast *ast = read_decl_or_func_def();
         if (!ast)
             return r;
+        /* 记录声明来源文件 */
+        if (ast->source_file == NULL) {
+            TokenInfo ti = get_current_token_info();
+            if (ti.file) ast->source_file = strdup(ti.file);
+        }
         while (pending_toplevel_decls && !list_empty(pending_toplevel_decls)) {
             Ast *pending = list_shift(pending_toplevel_decls);
-            if (pending) list_push(r, pending);
+            if (pending) {
+                if (pending->source_file == NULL) {
+                    TokenInfo ti = get_current_token_info();
+                    if (ti.file) pending->source_file = strdup(ti.file);
+                }
+                list_push(r, pending);
+            }
         }
         if (ast->type == AST_COMPOUND_STMT && ast->stmts) {
             for (Iter it = list_iter(ast->stmts); !iter_end(it);) {
                 Ast *item = iter_next(&it);
-                if (item) list_push(r, item);
+                if (item) {
+                    if (item->source_file == NULL) {
+                        TokenInfo ti = get_current_token_info();
+                        if (ti.file) item->source_file = strdup(ti.file);
+                    }
+                    list_push(r, item);
+                }
             }
         } else {
             list_push(r, ast);

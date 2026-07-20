@@ -155,6 +155,7 @@ typedef struct __Ctype {
 typedef struct __Ast {
     int type;
     Ctype *ctype;
+    const char *source_file;  /* 声明来源文件路径，用于 codegen 按文件分流 */
     union {
         /* char, int, or long */
         long long ival;
@@ -346,6 +347,7 @@ extern CtypeAttr get_attr(int in_attr);
 
 /* pp.c */
 extern bool pp_preprocess_to_stdin(const char *filename);
+extern void pp_global_on_init(void (*hook)(void));
 extern void pp_cleanup_temp(void);
 extern void pp_global_add_include_path(const char *path);
 extern void pp_global_define(const char *name, const char *body);

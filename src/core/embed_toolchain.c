@@ -119,7 +119,7 @@ static void extract_basename(const char *path, char *out, int out_sz) {
 /* ── 运行工具链命令（静默模式，输出定向到日志）── */
 static int run_step_silent(const char *keil_bin, const char *exe, const char *args, const char *log) {
     char cmd[8192];
-    snprintf(cmd, sizeof(cmd), "cmd.exe /C \"\"%s\\%s\" %s\" >\"%s\" 2>&1",
+    snprintf(cmd, sizeof(cmd), "%s\\%s %s >%s 2>&1",
              keil_bin, exe, args, log);
     return system(cmd);
 }
@@ -127,7 +127,7 @@ static int run_step_silent(const char *keil_bin, const char *exe, const char *ar
 /* ── 用 A51.EXE 汇编 .A51 文件 ── */
 static int assemble_a51(const char *keil_bin, const char *src_path, const char *obj_file, const char *log) {
     char args[8192];
-    snprintf(args, sizeof(args), "\"%s\" OBJECT(\"%s\")", src_path, obj_file);
+    snprintf(args, sizeof(args), "%s OBJECT(%s)", src_path, obj_file);
     return run_step_silent(keil_bin, "A51.EXE", args, log);
 }
 
@@ -329,14 +329,15 @@ static bool has_pragma_src(const char *c51_source) {
 }
 
 /* ── 编译单个 C51 文件（自动检测 #pragma SRC 并走 SRC→A51→OBJ 路径）── */
-static int compile_c51_file(const char *keil_bin, const char *source_file,
+static int compile_c51_file(const char *keil_bin, const char *keil_root,
+                            const char *source_file,
                             const char *source_label, const char *base_name,
                             const char *model_flag, const char *log,
-                            bool is_src_mode) {
+                            bool is_src_mode,
+                            List *include_dirs) {
     if (is_src_mode) {
         /* #pragma SRC 模式：
-         * C51.exe 不生成 .OBJ，只生成 .SRC 到源文件同目录。
-         * 然后 A51.EXE 汇编 .SRC → .OBJ */
+         * C51.exe 不生成 .OBJ，只生成 .SRC 到源文件同目录。 */
         char src_dir[1024], src_file_only[256];
         {
             const char *p = strrchr(source_file, '\\');
@@ -351,17 +352,16 @@ static int compile_c51_file(const char *keil_bin, const char *source_file,
                 src_file_only[sizeof(src_file_only) - 1] = '\0';
             }
         }
-        /* C51: 只需编译（不指定 OBJECT，因为 SRC 模式不产生 .OBJ） */
         {
             char args[8192], cmd[8192];
-            snprintf(args, sizeof(args), "\"%s\" %s",
+            snprintf(args, sizeof(args), "%s %s",
                      source_file, model_flag);
-            snprintf(cmd, sizeof(cmd), "cmd.exe /C \"\"%s\\%s\" %s\" >\"%s\" 2>&1",
-                     keil_bin, "C51.exe", args, log);
+            snprintf(cmd, sizeof(cmd), "%s\\C51.exe %s >%s 2>&1",
+                     keil_bin, args, log);
             int ret = system(cmd);
             if (ret && ret != 1) return ret;
         }
-        /* A51: 汇编 .SRC → .OBJ，SRC 在源文件所在目录 */
+        /* A51: 汇编 .SRC → .OBJ */
         {
             char src_path[1024], obj_path[1024], a51_log[1024];
             snprintf(src_path, sizeof(src_path), "%s\\%s.SRC", src_dir, base_name);
@@ -377,11 +377,11 @@ static int compile_c51_file(const char *keil_bin, const char *source_file,
         char obj_with_ext[512];
         snprintf(obj_with_ext, sizeof(obj_with_ext), "%s.OBJ", base_name);
         char args[8192];
-        snprintf(args, sizeof(args), "\"%s\" OBJECT(%s) %s",
+        snprintf(args, sizeof(args), "%s OBJECT(%s) %s",
                  source_file, obj_with_ext, model_flag);
         char cmd[8192];
-        snprintf(cmd, sizeof(cmd), "cmd.exe /C \"\"%s\\%s\" %s\" >\"%s\" 2>&1",
-                 keil_bin, "C51.exe", args, log);
+        snprintf(cmd, sizeof(cmd), "%s\\C51.exe %s >%s 2>&1",
+                 keil_bin, args, log);
         return system(cmd);
     }
 }
@@ -392,7 +392,6 @@ int embed_run_toolchain(List *source_files, List *source_labels,
                         const char *temp_dir, int c51_model,
                         List *include_dirs) {
     (void)temp_dir;
-    (void)include_dirs;
     if (list_empty(source_files)) return -1;
 
     const char *keil_bin = detect_keil_bin();
@@ -452,8 +451,10 @@ int embed_run_toolchain(List *source_files, List *source_labels,
 
             /* C51 编译 */
             fprintf(stdout, "  C51: %s%s\n", source_label, src_mode ? " (SRC mode)" : "");
-            int ret = compile_c51_file(keil_bin, source_file, source_label,
-                                       base_name, model_flag, log, src_mode);
+            const char *keil_root = detect_keil_root();
+            int ret = compile_c51_file(keil_bin, keil_root, source_file, source_label,
+                                       base_name, model_flag, log, src_mode,
+                                       include_dirs);
             if (ret && ret != 1) {
                 fprintf(stdout, "FAILED (exit %d)\n", ret);
                 return -1;
@@ -509,7 +510,7 @@ int embed_run_toolchain(List *source_files, List *source_labels,
         _unlink(a51_log);
     }
 
-    /* ── 阶段3: BL51 链接所有 OBJ + LIB → 直接输出 HEX ── */
+    /* ── 阶段3: BL51 链接所有 OBJ + LIB → .ABS，再 OH51 → Intel HEX ── */
     {
         const char *model_lib = "C51S.LIB";
         const char *model_fplib = "C51FPS.LIB";
@@ -540,36 +541,39 @@ int embed_run_toolchain(List *source_files, List *source_labels,
             pos = (int)strlen(args);
         }
 
-        /* 计算 HEX 输出路径 */
+        /* 计算 ABS 中间文件路径 */
+        const char *first = (const char*)list_get(source_files, 0);
+        char bn[256];
+        extract_basename(first, bn, sizeof(bn));
+        char abs_path[512];
+        snprintf(abs_path, sizeof(abs_path), "%s\\%s.ABS", cwd, bn);
+
+        /* 计算最终 HEX 输出路径 */
         char hex_abs[512];
         if (hex_out) {
             strncpy(hex_abs, hex_out, sizeof(hex_abs) - 1);
             hex_abs[sizeof(hex_abs) - 1] = '\0';
         } else {
-            const char *first = (const char*)list_get(source_files, 0);
-            char bn[256];
-            extract_basename(first, bn, sizeof(bn));
-            snprintf(hex_abs, sizeof(hex_abs), "%s\\%s.HEX", cwd, bn);
+            snprintf(hex_abs, sizeof(hex_abs), "%s\\a.HEX", cwd);
         }
 
-        /* 追加 LIB, FPLIB, TO */
+        /* 追加 LIB, FPLIB, TO（BL51 只输出 .ABS 格式，之后 OH51 转 Intel HEX） */
         snprintf(args + pos, sizeof(args) - pos, ",\"%s\",\"%s\" TO \"%s\"",
-                 lib_path, fplib_path, hex_abs);
+                 lib_path, fplib_path, abs_path);
 
         /* 运行 BL51 */
         char bl51_path[512];
         snprintf(bl51_path, sizeof(bl51_path), "%s\\BL51.EXE", keil_bin);
         char cmd[16384];
-        snprintf(cmd, sizeof(cmd), "cmd.exe /C \"\"%s\" %s\" >\"%s\" 2>&1",
+        snprintf(cmd, sizeof(cmd), "%s %s >%s 2>&1",
                  bl51_path, args, log);
         fprintf(stdout, "  BL51: linking %d object(s)\n", list_len(obj_list));
         int ret = system(cmd);
         /* 若失败尝试 C:\Keil_v5 */
         if (ret && ret != 1 && _access("C:\\Keil_v5\\C51\\BIN\\BL51.EXE", 0) == 0) {
             snprintf(bl51_path, sizeof(bl51_path), "C:\\Keil_v5\\C51\\BIN\\BL51.EXE");
-            snprintf(cmd, sizeof(cmd), "cmd.exe /C \"\"%s\" %s\" >\"%s\" 2>&1",
+            snprintf(cmd, sizeof(cmd), "%s %s >%s 2>&1",
                      bl51_path, args, log);
-            ret = system(cmd);
         }
         if (ret && ret != 1) {
             fprintf(stdout, "error: BL51 failed (exit %d)\n", ret);
@@ -586,14 +590,63 @@ int embed_run_toolchain(List *source_files, List *source_labels,
         }
         _unlink(log);
 
-        /* 如果 hex_out 不同于默认路径，复制 HEX */
-        if (hex_out) {
-            char default_hex[512];
-            const char *first = (const char*)list_get(source_files, 0);
-            char bn[256];
-            extract_basename(first, bn, sizeof(bn));
-            snprintf(default_hex, sizeof(default_hex), "%s\\%s.HEX", cwd, bn);
-            FILE *fs = fopen(default_hex, "rb");
+        /* ── OH51: .ABS → Intel HEX ── */
+        {
+            char oh51_log[512];
+            snprintf(oh51_log, sizeof(oh51_log), "%s\\oh51_log.txt", temp_dir);
+            /* OH51 输出 <basename>.hex 到 CWD。先将 .ABS 复制到 CWD 下短名 */
+            char abs_short[512];
+            snprintf(abs_short, sizeof(abs_short), "%s\\ttcc_out.ABS", cwd);
+            _unlink(abs_short);
+            {
+                FILE *fs = fopen(abs_path, "rb");
+                if (fs) {
+                    FILE *fd = fopen(abs_short, "wb");
+                    if (fd) {
+                        char bf[4096]; size_t n;
+                        while ((n = fread(bf, 1, sizeof(bf), fs)) > 0) fwrite(bf, 1, n, fd);
+                        fclose(fd);
+                    }
+                    fclose(fs);
+                }
+            }
+            fprintf(stdout, "  OH51: %s → %s\n", abs_path, hex_abs);
+            char oh51_cmd[16384];
+            snprintf(oh51_cmd, sizeof(oh51_cmd),
+                     "%s\\OH51.EXE %s >%s 2>&1",
+                     keil_bin, abs_short, oh51_log);
+            int oh_ret = system(oh51_cmd);
+            if (oh_ret && oh_ret != 1) {
+                fprintf(stdout, "error: OH51 failed (exit %d)\n", oh_ret);
+                _unlink(oh51_log);
+                return -1;
+            }
+            _unlink(oh51_log);
+            /* OH51 输出 ttcc_out.hex 到 CWD，复制到最终目标 */
+            {
+                char oh51_out[512];
+                snprintf(oh51_out, sizeof(oh51_out), "%s\\ttcc_out.hex", cwd);
+                _unlink(hex_abs);
+                if (rename(oh51_out, hex_abs) != 0) {
+                    FILE *fs = fopen(oh51_out, "rb");
+                    if (fs) {
+                        FILE *fd = fopen(hex_abs, "wb");
+                        if (fd) {
+                            char bf[4096]; size_t n;
+                            while ((n = fread(bf, 1, sizeof(bf), fs)) > 0) fwrite(bf, 1, n, fd);
+                            fclose(fd);
+                        }
+                        fclose(fs);
+                    }
+                }
+                _unlink(oh51_out);
+            }
+            _unlink(abs_short);
+        }
+
+        /* 如果 hex_out 不同于 hex_abs，才复制 */
+        if (hex_out && strcmp(hex_abs, hex_out) != 0) {
+            FILE *fs = fopen(hex_abs, "rb");
             if (fs) {
                 FILE *fd = fopen(hex_out, "wb");
                 if (fd) {
@@ -612,12 +665,14 @@ int embed_run_toolchain(List *source_files, List *source_labels,
         _unlink((const char*)list_get(cleanup_files, i));
     }
     {
-        char m51_abs[512];
         const char *first = (const char*)list_get(source_files, 0);
         char bn[256];
         extract_basename(first, bn, sizeof(bn));
+        char m51_abs[512], abs_abs[512];
         snprintf(m51_abs, sizeof(m51_abs), "%s\\%s.M51", cwd, bn);
+        snprintf(abs_abs, sizeof(abs_abs), "%s\\%s.ABS", cwd, bn);
         _unlink(m51_abs);
+        _unlink(abs_abs);
     }
     return 0;
 }

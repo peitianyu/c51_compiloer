@@ -119,8 +119,15 @@ static void c51_emit_type_prefix(FILE *out, Ctype *ctype) {
     c51_emit_memory_attr(out, a);
     /* struct/union 类型输出标签名（不展开定义）*/
     if (base->type == CTYPE_STRUCT) {
-        fprintf(out, "%s %s", base->is_union ? "union" : "struct",
-                base->tag ? base->tag : "?");
+        if (base->tag && strncmp(base->tag, "__anon_", 7) != 0 && strcmp(base->tag, "?") != 0) {
+            fprintf(out, "%s %s", base->is_union ? "union" : "struct", base->tag);
+        } else if (base->fields) {
+            /* 无有效 tag：内联展开定义 */
+            c51_emit_struct_def(out, base);
+        } else {
+            fprintf(out, "%s", base->is_union ? "union" : "struct");
+            if (base->tag) fprintf(out, " %s", base->tag);
+        }
     } else {
         fprintf(out, "%s", c51_base_type_name(base));
     }
@@ -196,10 +203,35 @@ static void c51_emit_sfr_decl(FILE *out, Ast *ast) {
     else if (a.ctype_c51_sfr16)
         fprintf(out, "sfr16 %s = 0x%04lX;\n", c51_map_name(ast->declvar->varname), addr);
     else if (a.ctype_c51_sbit) {
-        if (ast->declinit->type == AST_LITERAL)
+        if (ast->declinit->type == AST_LITERAL) {
+            /* sbit 字面量地址 */
             fprintf(out, "sbit %s = 0x%02lX;\n", c51_map_name(ast->declvar->varname), addr);
-        else {
-            /* sbit 表达式（例如 P0^6）：直接输出表达式 */
+        } else if (ast->declinit->type == '^') {
+            /* sbit = SFR^bit: 检测基地址是否位可寻址 */
+            unsigned long base_addr = 0;
+            bool base_is_bitaddr = false;
+            Ast *left = ast->declinit->left;
+            if (left && left->type == AST_GVAR && left->ctype && left->varname) {
+                CtypeAttr la = get_attr(left->ctype->attr);
+                if (la.ctype_c51_sfr) {
+                    /* 从全局变量查找 SFR 地址 */
+                    if (left->ginit && left->ginit->type == AST_LITERAL)
+                        base_addr = (unsigned long)left->ginit->ival;
+                    base_is_bitaddr = ((base_addr & 0x07) == 0);
+                }
+            }
+            if (!base_is_bitaddr) {
+                /* 基地址不是位可寻址（如 IE2=0xAF）：用 #define 代替 sbit */
+                fprintf(out, "#define %s ", c51_map_name(ast->declvar->varname));
+                c51_emit_expr(out, ast->declinit);
+                fprintf(out, "\n");
+            } else {
+                fprintf(out, "sbit %s = ", c51_map_name(ast->declvar->varname));
+                c51_emit_expr(out, ast->declinit);
+                fprintf(out, ";\n");
+            }
+        } else {
+            /* 其他 sbit 表达式（如 P0^6） */
             fprintf(out, "sbit %s = ", c51_map_name(ast->declvar->varname));
             c51_emit_expr(out, ast->declinit);
             fprintf(out, ";\n");
@@ -212,6 +244,34 @@ static void c51_emit_decl(FILE *out, Ast *ast) {
     Ctype *ct = ast->declvar->ctype;
     if (!ct) return;
     CtypeAttr a = get_attr(ct->attr);
+    /* 有初始化器的变量是定义，不是声明 — 去掉 extern */
+    bool suppress_extern = (ast->declinit && a.ctype_extern);
+    int saved_attr = ct->attr;
+    int saved_base_attr = 0;
+    bool base_was_modified = false;
+    Ctype *save_base = NULL;
+    if (suppress_extern) {
+        union { CtypeAttr c_attr; int i_attr; } adj = {0};
+        adj.i_attr = ct->attr;
+        adj.c_attr.ctype_extern = 0;
+        ct->attr = adj.i_attr;
+        a = adj.c_attr;
+        /* extern 也在基类型 attr 上（make_array_type 传播了 attr），也清除 */
+        Ctype *bt = ct;
+        while (bt && (bt->type == CTYPE_PTR || bt->type == CTYPE_ARRAY))
+            bt = bt->ptr;
+        if (bt) {
+            CtypeAttr ba = get_attr(bt->attr);
+            if (ba.ctype_extern) {
+                save_base = bt;
+                saved_base_attr = bt->attr;
+                adj.i_attr = bt->attr;
+                adj.c_attr.ctype_extern = 0;
+                bt->attr = adj.i_attr;
+                base_was_modified = true;
+            }
+        }
+    }
     if (a.ctype_c51_sfr || a.ctype_c51_sfr16 || a.ctype_c51_sbit) {
         c51_emit_sfr_decl(out, ast); return;
     }
@@ -222,8 +282,8 @@ static void c51_emit_decl(FILE *out, Ast *ast) {
         fprintf(out, ";\n"); return;
     }
     /* 输出完整声明：存储/内存属性 + 基础类型 + 指针* + 变量名 + 数组[] */
-    if (ct->type == CTYPE_STRUCT && !ct->tag) {
-        /* 匿名 struct：必须内联展开定义 */
+    if (ct->type == CTYPE_STRUCT && (!ct->tag || strncmp(ct->tag, "__anon_", 7) == 0)) {
+        /* 匿名 struct（含 __anon_ 标签）：必须内联展开定义 */
         c51_emit_memory_attr(out, a);
         c51_emit_struct_def(out, ct);
         fprintf(out, " %s", c51_map_name(ast->declvar->varname));
@@ -265,6 +325,7 @@ static void c51_emit_decl(FILE *out, Ast *ast) {
         }
     }
     fprintf(out, ";\n");
+    if (suppress_extern) ct->attr = saved_attr;
 }
 
 static void c51_emit_init(FILE *out, Ast *init) {
@@ -562,13 +623,10 @@ static void c51_emit_expr(FILE *out, Ast *ast) {
     case AST_FUNC_DECL: case AST_FUNC_DEF: fprintf(out, "%s", c51_map_name(ast->fname)); break;
     case AST_FUNCALL:
         if (ast->fnexpr) {
-            /* 函数指针调用需要括号包裹 */
-            if (ast->fnexpr->type == AST_STRUCT_REF || ast->fnexpr->type == AST_DEREF ||
-                ast->fnexpr->type == AST_LVAR || ast->fnexpr->type == AST_GVAR) {
-                c51_emit_expr(out, ast->fnexpr);
-            } else {
-                fprintf(out, "("); c51_emit_expr(out, ast->fnexpr); fprintf(out, ")");
-            }
+            /* 函数指针调用：((void (*)(void))(expr))(args) */
+            fprintf(out, "((void (*)(void))(");
+            c51_emit_expr(out, ast->fnexpr);
+            fprintf(out, "))");
         }
         else fprintf(out, "%s", c51_map_name(ast->fname));
         fprintf(out, "(");
@@ -775,11 +833,11 @@ void c51_emit_translation_unit(FILE *out, List *toplevels, int c51_model, bool m
     g_map_names_enabled = map_names;
     /* 初始化去重表 */
     if (!g_emitted_sfr) g_emitted_sfr = make_dict(NULL);
-    else dict_clear(g_emitted_sfr);
+    else dict_reset(g_emitted_sfr);
     if (!g_emitted_typedef) g_emitted_typedef = make_dict(NULL);
-    else dict_clear(g_emitted_typedef);
+    else dict_reset(g_emitted_typedef);
     if (!g_emitted_funcdecl) g_emitted_funcdecl = make_dict(NULL);
-    else dict_clear(g_emitted_funcdecl);
+    else dict_reset(g_emitted_funcdecl);
     fprintf(out, "/* Generated by ttcc (C11 to C51 translator) */\n");
     fprintf(out, "/* Memory model: %s */\n\n",
             c51_model == 0 ? "small" : c51_model == 1 ? "compact" : "large");
@@ -803,6 +861,120 @@ void c51_emit_translation_unit(FILE *out, List *toplevels, int c51_model, bool m
         c51_emit_toplevel(out, (Ast*)list_get(toplevels, i));
 
     /* 输出中文→ASCII 标识符映射（供 embed_toolchain 反向查错用） */
+    if (g_name_map && list_len(g_name_map->list) > 0) {
+        fprintf(out, "\n/* __TTCC_NAME_MAP__");
+        for (int i = 0; i < list_len(g_name_map->list); i++) {
+            DictEntry *e = (DictEntry*)list_get(g_name_map->list, i);
+            fprintf(out, " %s=%s", e->key, (const char*)e->val);
+        }
+        fprintf(out, " */\n");
+    }
+}
+
+/* ── 从 toplevels 收集所有被引用的 .h 文件路径（去重）── */
+Dict *c51_collect_headers(List *toplevels) {
+    Dict *headers = make_dict(NULL);
+    if (!toplevels) return headers;
+    int n = list_len(toplevels);
+    for (int i = 0; i < n; i++) {
+        Ast *ast = (Ast*)list_get(toplevels, i);
+        if (!ast) continue;
+        if (!ast->source_file) continue;
+        const char *sf = ast->source_file;
+        if (!*sf) continue;
+        const char *ext = strrchr(sf, '.');
+        if (ext) {
+            int ext_len = (int)strlen(ext);
+            if ((ext_len == 2 && ext[0] == '.' && (ext[1] == 'h' || ext[1] == 'H')) ||
+                (ext_len == 4 && (ext[0]=='.'&&ext[1]=='h'&&(ext[2]=='p'||ext[2]=='P')&&(ext[3]=='p'||ext[3]=='P')))) {
+                if (!dict_get(headers, sf))
+                    dict_put(headers, strdup(sf), (void*)1);
+            }
+        }
+    }
+    return headers;
+}
+
+/* ── 仅输出来自指定源文件的顶层声明 ── */
+void c51_emit_filtered(FILE *out, List *toplevels,
+                       const char *source_filter,
+                       Dict *out_includes,
+                       int c51_model, bool map_names) {
+    g_c51_mem_model = c51_model;
+    g_map_names_enabled = map_names;
+    if (!g_emitted_sfr) g_emitted_sfr = make_dict(NULL);
+    else dict_reset(g_emitted_sfr);
+    if (!g_emitted_typedef) g_emitted_typedef = make_dict(NULL);
+    else dict_reset(g_emitted_typedef);
+    if (!g_emitted_funcdecl) g_emitted_funcdecl = make_dict(NULL);
+    else dict_reset(g_emitted_funcdecl);
+
+    if (source_filter) {
+        /* 判断 source_filter 是否是 .h 文件 */
+        bool is_header = false;
+        {
+            const char *dot = strrchr(source_filter, '.');
+            if (dot && (dot[1] == 'h' || dot[1] == 'H')) is_header = true;
+        }
+        if (!is_header) {
+            /* .c51: 先输出 #include，再输出自身声明 */
+            Dict *all_headers = c51_collect_headers(toplevels);
+            Dict *emitted_include = make_dict(NULL);
+            for (int i = 0; i < list_len(all_headers->list); i++) {
+                DictEntry *e = (DictEntry*)list_get(all_headers->list, i);
+                const char *h_path = e->key;
+                if (strcmp(h_path, source_filter) == 0) continue;
+                if (out_includes && !dict_get(out_includes, h_path))
+                    dict_put(out_includes, strdup(h_path), (void*)1);
+                char h51_path[1024];
+                const char *dot = strrchr(h_path, '.');
+                if (dot) {
+                    int base_len = (int)(dot - h_path);
+                    snprintf(h51_path, sizeof(h51_path), "%.*s.h51", base_len, h_path);
+                } else {
+                    snprintf(h51_path, sizeof(h51_path), "%s.h51", h_path);
+                }
+                const char *base = strrchr(h51_path, '/');
+                if (!base) base = strrchr(h51_path, '\\');
+                if (!base) base = h51_path; else base++;
+                if (!dict_get(emitted_include, base)) {
+                    fprintf(out, "#include \"%s\"\n", base);
+                    dict_put(emitted_include, strdup(base), (void*)1);
+                }
+            }
+            fprintf(out, "\n");
+            free(emitted_include->list); free(emitted_include);
+            free(all_headers->list); free(all_headers);
+        }
+    }
+
+    /* 第二遍：输出匹配的声明 */
+    bool has_asm = false;
+    if (toplevels) {
+        for (int i = 0; i < list_len(toplevels) && !has_asm; i++) {
+            Ast *ast = (Ast*)list_get(toplevels, i);
+            if (source_filter && ast->source_file &&
+                strcmp(ast->source_file, source_filter) != 0)
+                continue;
+            if (ast->type == AST_FUNC_DEF && ast->body) {
+                lower_walk_ast(ast->body, &detect_asm_visitor);
+                if (g_detected_asm) { has_asm = true; g_detected_asm = false; }
+            }
+        }
+    }
+    if (has_asm) {
+        fprintf(out, "#pragma SRC\n\n");
+    }
+    if (!toplevels) return;
+    for (int i = 0; i < list_len(toplevels); i++) {
+        Ast *ast = (Ast*)list_get(toplevels, i);
+        if (source_filter && ast->source_file &&
+            strcmp(ast->source_file, source_filter) != 0)
+            continue;
+        c51_emit_toplevel(out, ast);
+    }
+
+    /* 输出中文名映射 */
     if (g_name_map && list_len(g_name_map->list) > 0) {
         fprintf(out, "\n/* __TTCC_NAME_MAP__");
         for (int i = 0; i < list_len(g_name_map->list); i++) {
